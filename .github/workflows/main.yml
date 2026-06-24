@@ -38,15 +38,24 @@ jobs:
         run: |
           set -e
           sudo apt-get update
-          sudo apt-get install -y git rsync python3 python3-pip patchelf jq
+          sudo apt-get install -y \
+            git rsync python3 python3-pip jq \
+            patchelf openjdk-21-jre-headless openjdk-21-jdk-headless
 
-      - name: Prepare extract-tools symlinks
+      - name: Prepare required prebuilts paths (patchelf + java)
         run: |
           set -e
+
+          # patchelf paths expected by extract-utils
           mkdir -p "$LOS_ROOT/prebuilts/extract-tools/linux-x86/bin"
           PATCHELF_BIN="$(command -v patchelf)"
           ln -sf "$PATCHELF_BIN" "$LOS_ROOT/prebuilts/extract-tools/linux-x86/bin/patchelf-0_18"
           ln -sf "$PATCHELF_BIN" "$LOS_ROOT/prebuilts/extract-tools/linux-x86/bin/patchelf-0_17_2"
+
+          # java path expected by extract-utils/apktool
+          mkdir -p "$LOS_ROOT/prebuilts/jdk/jdk21/linux-x86/bin"
+          ln -sf "$(command -v java)"  "$LOS_ROOT/prebuilts/jdk/jdk21/linux-x86/bin/java"
+          ln -sf "$(command -v javac)" "$LOS_ROOT/prebuilts/jdk/jdk21/linux-x86/bin/javac"
 
       - name: Clone device tree
         run: |
@@ -173,8 +182,9 @@ jobs:
 
                   ok = False
                   for c in cands:
-                      if c not in all_set and "/" in c and c not in [p, f"vendor/{p}", f"system/system/{p}", f"product/{p}", f"system_ext/{p}", f"mi_ext/{p}"]:
-                          continue
+                      # Allow direct candidate and basename fallback hits
+                      if c not in all_set and c not in [p, f"vendor/{p}", f"system/system/{p}", f"product/{p}", f"system_ext/{p}", f"mi_ext/{p}"]:
+                        continue
                       try:
                           data = fetch(c)
                           os.makedirs(os.path.dirname(local), exist_ok=True)
@@ -212,7 +222,7 @@ jobs:
           fw = Path("proprietary-firmware.txt")
           allf = Path(os.environ["DUMP_DIR"]) / "all_files.txt"
 
-          # fix '-' before packages
+          # Fix invalid '-' for packages
           if pf.exists():
               out = []
               for l in pf.read_text(errors="ignore").splitlines():
@@ -220,12 +230,12 @@ jobs:
                   if s.startswith("-"):
                       core = s[1:]
                       check = core.split("|",1)[0].split(":",1)[0]
-                      if re.search(r"\.(apk|jar|apex)$", check):
+                      if re.search(r"\.(apk|jar|apex|xml)$", check):
                           l = l.replace("-", "", 1)
                   out.append(l)
               pf.write_text("\n".join(out) + "\n")
 
-          # prune firmware lines not present by basename (best-effort)
+          # Prune firmware lines not present in dump (basename check)
           if fw.exists() and allf.exists():
               base = set()
               for l in allf.read_text(errors="ignore").splitlines():
@@ -290,4 +300,4 @@ jobs:
             -H "Authorization: Bearer ${BOT_TOKEN}" \
             -H "Accept: application/vnd.github+json" \
             "https://api.github.com/repos/${OWNER}/${{ github.event.repository.name }}" \
-            -d '{"default_branch":"lineage-23.2"}' || true
+            -d '{"default_branch":"lineage-23.2"}' >/dev/null || true
