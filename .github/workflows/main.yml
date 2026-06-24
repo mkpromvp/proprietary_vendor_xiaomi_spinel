@@ -207,11 +207,6 @@ jobs:
 
           echo "Prepared dump from: ${SRC_DIR}"
 
-      - name: Free temporary dump workspace
-        run: |
-          set -euo pipefail
-          rm -rf stock_dump
-
       - name: Patch and prune proprietary lists for this dump
         run: |
           set -euo pipefail
@@ -279,9 +274,15 @@ jobs:
 
           test -f extract-files.py
           test -f setup-makefiles.py
+          test -d "$(pwd)/../../../../prepared_dump"
 
-          PYTHONPATH=../../../tools/extract-utils python3 extract-files.py "$(pwd)/../../../prepared_dump"
+          PYTHONPATH=../../../tools/extract-utils python3 extract-files.py "$(pwd)/../../../../prepared_dump"
           PYTHONPATH=../../../tools/extract-utils python3 setup-makefiles.py
+
+      - name: Free temporary dump workspace
+        run: |
+          set -euo pipefail
+          rm -rf stock_dump prepared_dump
 
       - name: Validate generated vendor tree
         run: |
