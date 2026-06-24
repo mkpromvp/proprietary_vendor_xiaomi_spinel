@@ -45,6 +45,17 @@ jobs:
           fetch-depth: 0
           path: android/vendor/xiaomi/spinel
 
+      - name: Cleanup runner disk space
+        run: |
+          set -euo pipefail
+          echo "Disk before cleanup:"
+          df -h /
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/share/boost || true
+          sudo rm -rf /usr/local/lib/android || true
+          sudo docker image prune -af >/dev/null 2>&1 || true
+          echo "Disk after cleanup:"
+          df -h /
+
       - name: Install dependencies
         run: |
           set -euo pipefail
@@ -117,30 +128,64 @@ jobs:
           set -euo pipefail
           git clone --depth=1 --filter=blob:none --no-checkout -b "${{ inputs.DUMP_BRANCH }}" "${DUMP_REPO}" stock_dump
           cd stock_dump
-          git sparse-checkout init --cone
+          git sparse-checkout init --no-cone
           git sparse-checkout set \
-            system vendor product system_ext odm mi_ext vendor_dlkm system_dlkm odm_dlkm \
-            extracted/system extracted/vendor extracted/product extracted/system_ext extracted/odm extracted/mi_ext extracted/vendor_dlkm extracted/system_dlkm extracted/odm_dlkm
+            /system/** /vendor/** /product/** /system_ext/** /odm/** /mi_ext/** /vendor_dlkm/** /system_dlkm/** /odm_dlkm/** \
+            /extracted/system/** /extracted/vendor/** /extracted/product/** /extracted/system_ext/** /extracted/odm/** /extracted/mi_ext/** /extracted/vendor_dlkm/** /extracted/system_dlkm/** /extracted/odm_dlkm/**
           git checkout
+
+      - name: Inspect dump layout
+        run: |
+          set -euo pipefail
+          for base in stock_dump stock_dump/extracted; do
+            echo "== ${base} =="
+            for p in system vendor product system_ext odm mi_ext vendor_dlkm system_dlkm odm_dlkm; do
+              if [ -d "${base}/${p}" ]; then
+                c=$(find "${base}/${p}" -type f | head -n 1 | wc -l)
+                echo "${p}: present (has_file=${c})"
+              else
+                echo "${p}: missing"
+              fi
+            done
+          done
 
       - name: Prepare unpacked dump
         run: |
           set -euo pipefail
           ROOT="$(pwd)"
 
+          has_partition_content() {
+            local base="$1"
+            for p in system vendor product system_ext odm mi_ext vendor_dlkm system_dlkm odm_dlkm; do
+              if [ -d "${base}/${p}" ] && [ -n "$(find "${base}/${p}" -mindepth 1 -print -quit)" ]; then
+                return 0
+              fi
+            done
+            return 1
+          }
+
           SRC_DIR="${ROOT}/stock_dump"
-          if [ -d "${ROOT}/stock_dump/extracted/system" ]; then
+          if has_partition_content "${ROOT}/stock_dump/extracted"; then
             SRC_DIR="${ROOT}/stock_dump/extracted"
+          elif has_partition_content "${ROOT}/stock_dump"; then
+            SRC_DIR="${ROOT}/stock_dump"
+          else
+            echo "::error::No partition content found in stock dump"
+            exit 1
           fi
 
           OUT_DIR="${ROOT}/prepared_dump"
           mkdir -p "${OUT_DIR}"
 
+          FOUND=0
           for p in system vendor product system_ext odm mi_ext vendor_dlkm system_dlkm odm_dlkm; do
-            if [ -d "${SRC_DIR}/${p}" ]; then
+            if [ -d "${SRC_DIR}/${p}" ] && [ -n "$(find "${SRC_DIR}/${p}" -mindepth 1 -print -quit)" ]; then
               ln -sfn "${SRC_DIR}/${p}" "${OUT_DIR}/${p}"
+              FOUND=1
             fi
           done
+
+          [ "${FOUND}" -eq 1 ] || (echo "::error::No non-empty partitions linked" && exit 1)
 
           # extract-utils expects cross-partition visibility from /system as well.
           mkdir -p "${OUT_DIR}/system"
@@ -150,12 +195,17 @@ jobs:
             fi
           done
 
-          if [ ! -d "${OUT_DIR}/system" ] || [ -z "$(find "${OUT_DIR}/system" -mindepth 1 -print -quit)" ]; then
-            echo "::error::No unpacked system content found in dump"
+          if [ -z "$(find "${OUT_DIR}" -mindepth 2 -print -quit)" ]; then
+            echo "::error::Prepared dump is empty"
             exit 1
           fi
 
           echo "Prepared dump from: ${SRC_DIR}"
+
+      - name: Free temporary dump workspace
+        run: |
+          set -euo pipefail
+          rm -rf stock_dump
 
       - name: Patch and prune proprietary lists for this dump
         run: |
