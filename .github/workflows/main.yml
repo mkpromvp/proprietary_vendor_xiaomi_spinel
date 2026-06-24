@@ -3,37 +3,72 @@ name: Generate Spinel Vendor Tree
 on:
   workflow_dispatch:
 
+concurrency:
+  group: vendor-spinel-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   build-vendor:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    env:
+      OWNER: mkpromvp
+      DEVICE_REPO: android_device_xiaomi_spinel
+      DEVICE_BRANCH: lineage-23.2
+      VENDOR_BRANCH: lineage-23.2
+      DUMP_REF: dump-redmi-spinel-os3.0.301.0.wpgmixm
+
+      LOS_ROOT: /home/runner/android/lineage
+      DEVICE_DIR: /home/runner/android/lineage/device/xiaomi/spinel
+      TOOLS_DIR: /home/runner/android/lineage/tools/extract-utils
+      DUMP_DIR: /home/runner/stock_dumps/spinel_sparse
+      PATHS_FILE: /home/runner/stock_dumps/spinel_paths.txt
+
+      GITLAB_PROJECT_ENC: mkpromvp%2FStock_room_dumb
 
     steps:
-      - name: Checkout current repo
+      - name: Checkout vendor repo (this repo)
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-      - name: Prepare dirs
+      - name: Install dependencies
         run: |
           set -e
-          mkdir -p ~/android/lineage/device/xiaomi
-          mkdir -p ~/android/lineage/tools
-          mkdir -p ~/android/lineage/prebuilts
-          mkdir -p ~/stock_dumps
+          sudo apt-get update
+          sudo apt-get install -y git rsync python3 python3-pip patchelf jq
+
+      - name: Prepare extract-tools symlinks
+        run: |
+          set -e
+          mkdir -p "$LOS_ROOT/prebuilts/extract-tools/linux-x86/bin"
+          PATCHELF_BIN="$(command -v patchelf)"
+          ln -sf "$PATCHELF_BIN" "$LOS_ROOT/prebuilts/extract-tools/linux-x86/bin/patchelf-0_18"
+          ln -sf "$PATCHELF_BIN" "$LOS_ROOT/prebuilts/extract-tools/linux-x86/bin/patchelf-0_17_2"
 
       - name: Clone device tree
         run: |
           set -e
-          git clone --depth=1 --branch lineage-23.2 https://github.com/${{ github.repository_owner }}/android_device_xiaomi_spinel.git ~/android/lineage/device/xiaomi/spinel
+          mkdir -p "$LOS_ROOT/device/xiaomi"
+          git clone --depth=1 --branch "$DEVICE_BRANCH" \
+            "https://github.com/${OWNER}/${DEVICE_REPO}.git" \
+            "$DEVICE_DIR"
 
-      - name: Clone extract-utils + extract-tools prebuilts
+      - name: Clone Lineage extract-utils
         run: |
           set -e
-          git clone --depth=1 https://github.com/LineageOS/android_tools_extract-utils ~/android/lineage/tools/extract-utils
-          git clone --depth=1 https://github.com/LineageOS/android_prebuilts_extract-tools ~/android/lineage/prebuilts/extract-tools
+          mkdir -p "$LOS_ROOT/tools"
+          git clone --depth=1 \
+            https://github.com/LineageOS/android_tools_extract-utils \
+            "$TOOLS_DIR"
 
-      - name: Build sparse paths list
+      - name: Build sparse paths list from proprietary files
         run: |
           set -e
-          cd ~/android/lineage/device/xiaomi/spinel
+          mkdir -p /home/runner/stock_dumps
+          cd "$DEVICE_DIR"
 
           awk '
           /^[[:space:]]*#/ {next}
@@ -45,7 +80,7 @@ jobs:
             sub(/:.*/, "", line)
             gsub(/[[:space:]]+$/, "", line)
             if (line!="") print line
-          }' proprietary-files.txt > ~/stock_dumps/spinel_paths.txt
+          }' proprietary-files.txt > "$PATHS_FILE"
 
           if [ -f proprietary-firmware.txt ]; then
             awk '
@@ -58,119 +93,195 @@ jobs:
               sub(/;.*/, "", line)
               gsub(/[[:space:]]+$/, "", line)
               if (line!="") print line
-            }' proprietary-firmware.txt >> ~/stock_dumps/spinel_paths.txt
+            }' proprietary-firmware.txt >> "$PATHS_FILE"
           fi
 
-          cat >> ~/stock_dumps/spinel_paths.txt <<'EOF'
-          all_files.txt
+          cat >> "$PATHS_FILE" <<'EOF'
           vendor/build.prop
           system/system/build.prop
           vendor_boot/recovery_ramdisk/first_stage_ramdisk/fstab.emmc
+          all_files.txt
           EOF
 
-          sort -u ~/stock_dumps/spinel_paths.txt -o ~/stock_dumps/spinel_paths.txt
+          sort -u "$PATHS_FILE" -o "$PATHS_FILE"
+          echo "Paths count: $(wc -l < "$PATHS_FILE")"
 
-      - name: Clone dump sparse
+      - name: Sparse clone dump branch
         run: |
           set -e
-          git clone --filter=blob:none --no-checkout --depth=1 --branch dump-redmi-spinel-os3.0.301.0.wpgmixm https://gitlab.com/mkpromvp/Stock_room_dumb.git ~/stock_dumps/spinel_sparse
-          cd ~/stock_dumps/spinel_sparse
+          rm -rf "$DUMP_DIR"
+          git clone --filter=blob:none --no-checkout --depth=1 --branch "$DUMP_REF" \
+            "https://gitlab.com/mkpromvp/Stock_room_dumb.git" \
+            "$DUMP_DIR"
+
+          cd "$DUMP_DIR"
           git sparse-checkout init --no-cone
-          cp ~/stock_dumps/spinel_paths.txt .git/info/sparse-checkout
+          cp "$PATHS_FILE" .git/info/sparse-checkout
           git checkout
 
-      - name: Resolve missing paths by basename fallback
+      - name: Fallback fetch for missing files via GitLab API
         run: |
           set -e
           python3 - <<'PY'
-          import os, re, shutil
+          import os, urllib.parse, urllib.request, time
 
-          dump = os.path.expanduser("~/stock_dumps/spinel_sparse")
-          allf = os.path.join(dump, "all_files.txt")
-          pathsf = os.path.expanduser("~/stock_dumps/spinel_paths.txt")
+          dump_dir = os.environ["DUMP_DIR"]
+          paths_file = os.environ["PATHS_FILE"]
+          ref = os.environ["DUMP_REF"]
+          proj = os.environ["GITLAB_PROJECT_ENC"]
 
-          if not os.path.exists(allf):
-              raise SystemExit("all_files.txt not found in sparse dump")
+          api_files = f"https://gitlab.com/api/v4/projects/{proj}/repository/files"
 
-          with open(allf, "r", encoding="utf-8", errors="ignore") as f:
-              all_paths = [x.strip() for x in f if x.strip()]
+          def fetch(remote):
+              q = urllib.parse.quote(remote, safe="")
+              url = f"{api_files}/{q}/raw?ref={urllib.parse.quote(ref)}"
+              with urllib.request.urlopen(url, timeout=60) as r:
+                  return r.read()
 
-          by_base = {}
-          for p in all_paths:
-              by_base.setdefault(os.path.basename(p), []).append(p)
+          all_file = os.path.join(dump_dir, "all_files.txt")
+          if not os.path.exists(all_file):
+              try:
+                  os.makedirs(dump_dir, exist_ok=True)
+                  with open(all_file, "wb") as f:
+                      f.write(fetch("all_files.txt"))
+              except Exception:
+                  pass
 
-          def ensure_path(rel):
-              target = os.path.join(dump, rel)
-              if os.path.exists(target):
-                  return True
-              bn = os.path.basename(rel)
-              cands = by_base.get(bn, [])
-              if not cands:
-                  return False
-              src_rel = cands[0]
-              src = os.path.join(dump, src_rel)
-              if not os.path.exists(src):
-                  return False
-              os.makedirs(os.path.dirname(target), exist_ok=True)
-              shutil.copy2(src, target)
-              print(f"[FALLBACK] {rel} <= {src_rel}")
-              return True
+          all_paths = []
+          if os.path.exists(all_file):
+              with open(all_file, "r", encoding="utf-8", errors="ignore") as f:
+                  all_paths = [x.strip() for x in f if x.strip()]
 
-          with open(pathsf, "r", encoding="utf-8", errors="ignore") as f:
-              reqs = [x.strip() for x in f if x.strip()]
+          all_set = set(all_paths)
 
-          miss = []
-          for r in reqs:
-              if not ensure_path(r):
-                  miss.append(r)
+          fixed = 0
+          missing = []
 
-          with open(os.path.expanduser("~/stock_dumps/still_missing.txt"), "w", encoding="utf-8") as f:
-              for m in miss:
+          with open(paths_file, "r", encoding="utf-8", errors="ignore") as f:
+              for line in f:
+                  p = line.strip()
+                  if not p:
+                      continue
+
+                  local = os.path.join(dump_dir, p)
+                  if os.path.exists(local):
+                      continue
+
+                  bn = os.path.basename(p)
+                  cands = [p, f"vendor/{p}", f"system/system/{p}", f"product/{p}", f"system_ext/{p}", f"mi_ext/{p}"]
+                  cands += [x for x in all_paths if x == bn or x.endswith("/" + bn)][:10]
+
+                  ok = False
+                  for c in cands:
+                      if c not in all_set and "/" in c and c not in [p, f"vendor/{p}", f"system/system/{p}", f"product/{p}", f"system_ext/{p}", f"mi_ext/{p}"]:
+                          continue
+                      try:
+                          data = fetch(c)
+                          os.makedirs(os.path.dirname(local), exist_ok=True)
+                          with open(local, "wb") as out:
+                              out.write(data)
+                          print(f"[FALLBACK] {p} <= {c}")
+                          fixed += 1
+                          ok = True
+                          break
+                      except Exception:
+                          time.sleep(0.2)
+
+                  if not ok:
+                      missing.append(p)
+
+          miss_file = os.path.join(dump_dir, "still_missing.txt")
+          with open(miss_file, "w", encoding="utf-8") as f:
+              for m in missing:
                   f.write(m + "\n")
 
-          print("missing:", len(miss))
+          print("missing:", len(missing))
           PY
 
-      - name: Trim missing firmware entries (non-fatal)
+      - name: Sanitize proprietary lists in workspace copy
         run: |
           set -e
-          cd ~/android/lineage/device/xiaomi/spinel
-          cp -f proprietary-firmware.txt proprietary-firmware.txt.bak || true
-          if [ -f ~/stock_dumps/still_missing.txt ] && [ -f proprietary-firmware.txt ]; then
-            while IFS= read -r m; do
-              [ -z "$m" ] && continue
-              # only trim firmware-style entries
-              echo "$m" | grep -Eq '\.img$|preloader' || continue
-              sed -i "\#^$m#d" proprietary-firmware.txt || true
-            done < ~/stock_dumps/still_missing.txt
-          fi
+          cd "$DEVICE_DIR"
 
-      - name: Extract blobs
+          python3 - <<'PY'
+          import re
+          from pathlib import Path
+          import os
+
+          pf = Path("proprietary-files.txt")
+          fw = Path("proprietary-firmware.txt")
+          allf = Path(os.environ["DUMP_DIR"]) / "all_files.txt"
+
+          # fix '-' before packages
+          if pf.exists():
+              out = []
+              for l in pf.read_text(errors="ignore").splitlines():
+                  s = l.strip()
+                  if s.startswith("-"):
+                      core = s[1:]
+                      check = core.split("|",1)[0].split(":",1)[0]
+                      if re.search(r"\.(apk|jar|apex)$", check):
+                          l = l.replace("-", "", 1)
+                  out.append(l)
+              pf.write_text("\n".join(out) + "\n")
+
+          # prune firmware lines not present by basename (best-effort)
+          if fw.exists() and allf.exists():
+              base = set()
+              for l in allf.read_text(errors="ignore").splitlines():
+                  l = l.strip()
+                  if l:
+                      base.add(l.split("/")[-1])
+
+              out = []
+              for l in fw.read_text(errors="ignore").splitlines():
+                  s = l.strip()
+                  if not s or s.startswith("#"):
+                      out.append(l)
+                      continue
+                  token = s.split("|",1)[0].split(":",1)[0].split(";",1)[0].strip()
+                  bn = token.split("/")[-1]
+                  if bn in base:
+                      out.append(l)
+              fw.write_text("\n".join(out) + "\n")
+          PY
+
+      - name: Extract blobs and generate makefiles
         run: |
           set -e
-          cd ~/android/lineage/device/xiaomi/spinel
+          cd "$DEVICE_DIR"
           chmod +x extract-files.py setup-makefiles.py
-          ./extract-files.py ~/stock_dumps/spinel_sparse
+          ./extract-files.py "$DUMP_DIR"
           ./setup-makefiles.py
 
-      - name: Push vendor repo
+      - name: Sync generated vendor tree into repo workspace
+        run: |
+          set -e
+          SRC="$LOS_ROOT/vendor/xiaomi/spinel"
+          DST="$GITHUB_WORKSPACE"
+          [ -d "$SRC" ] || { echo "Vendor tree not generated at $SRC"; exit 1; }
+
+          rsync -a --delete --exclude '.git' "$SRC"/ "$DST"/
+
+      - name: Commit and push lineage-23.2
         env:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
         run: |
           set -e
-          cd ~/android/lineage/vendor/xiaomi/spinel
-          rm -rf .git
-          git init
-          git checkout -b lineage-23.2
+          cd "$GITHUB_WORKSPACE"
+
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add .
-          git commit -m "spinel: auto-generate vendor tree from stock dump"
 
-          git remote add origin "https://${{ github.repository_owner }}:${BOT_TOKEN}@github.com/${{ github.repository_owner }}/proprietary_vendor_xiaomi_spinel.git"
-          git push -u origin lineage-23.2 --force
+          git checkout -B "$VENDOR_BRANCH"
 
-      - name: Set default branch
+          git add -A
+          git commit -m "spinel: regenerate proprietary vendor tree from ${DUMP_REF}" || echo "No changes"
+
+          git remote set-url origin "https://${OWNER}:${BOT_TOKEN}@github.com/${OWNER}/${{ github.event.repository.name }}.git"
+          git push -u origin "$VENDOR_BRANCH" --force-with-lease
+
+      - name: Set default branch to lineage-23.2
         env:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
         run: |
@@ -178,5 +289,5 @@ jobs:
           curl -sS -X PATCH \
             -H "Authorization: Bearer ${BOT_TOKEN}" \
             -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/${{ github.repository_owner }}/proprietary_vendor_xiaomi_spinel" \
-            -d '{"default_branch":"lineage-23.2"}'
+            "https://api.github.com/repos/${OWNER}/${{ github.event.repository.name }}" \
+            -d '{"default_branch":"lineage-23.2"}' || true
