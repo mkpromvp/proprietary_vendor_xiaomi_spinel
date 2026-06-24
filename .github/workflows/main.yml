@@ -224,6 +224,10 @@ jobs:
           sed -i '/^mi_ext\/system_ext\/app\/MtkCalendar\/MtkCalendar\.apk$/d' "${DEV_DIR}/proprietary-files.txt"
           sed -i '/^mi_ext\/system_ext\/priv-app\/MtkContacts\/MtkContacts\.apk$/d' "${DEV_DIR}/proprietary-files.txt"
 
+          # Avoid duplicate path after bin/iwpriv -> vendor/bin/iwpriv rewrite.
+          awk '!seen[$0]++' "${DEV_DIR}/proprietary-files.txt" > "${DEV_DIR}/proprietary-files.txt.tmp"
+          mv "${DEV_DIR}/proprietary-files.txt.tmp" "${DEV_DIR}/proprietary-files.txt"
+
           # Keep comments/directives as-is, but drop entries that do not exist in this dump.
           tmp_list="$(mktemp)"
           while IFS= read -r line || [ -n "$line" ]; do
@@ -247,6 +251,45 @@ jobs:
           done < "${DEV_DIR}/proprietary-files.txt"
 
           mv "${tmp_list}" "${DEV_DIR}/proprietary-files.txt"
+
+          # extract-utils fails on duplicate destination entries, so dedupe by dst path.
+          python3 - <<'PY'
+import re
+from pathlib import Path
+
+pf = Path("android/device/xiaomi/spinel/proprietary-files.txt")
+out = []
+seen_dst = set()
+
+for raw in pf.read_text(encoding="utf-8").splitlines():
+    line = raw.rstrip("\n")
+    stripped = line.strip()
+    if not stripped or stripped.startswith("#") or stripped.startswith(":"):
+        out.append(line)
+        continue
+
+    entry = stripped
+    if entry.startswith("-"):
+        entry = entry[1:]
+    if entry.startswith("?"):
+        entry = entry[1:]
+
+    entry = entry.split(";", 1)[0]
+    if ":" in entry:
+        src, dst = entry.split(":", 1)
+        dst_key = dst
+    else:
+        src = entry
+        dst_key = src
+
+    if dst_key in seen_dst:
+        continue
+
+    seen_dst.add(dst_key)
+    out.append(line)
+
+pf.write_text("\n".join(out) + "\n", encoding="utf-8")
+PY
 
           if [ -f "${DEV_DIR}/proprietary-firmware.txt" ]; then
             cp -f "${DEV_DIR}/proprietary-firmware.txt" "${DEV_DIR}/proprietary-firmware.txt.bak"
