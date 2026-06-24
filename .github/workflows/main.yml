@@ -141,8 +141,12 @@ jobs:
             echo "== ${base} =="
             for p in system vendor product system_ext odm mi_ext vendor_dlkm system_dlkm odm_dlkm; do
               if [ -d "${base}/${p}" ]; then
-                c=$(find "${base}/${p}" -type f | head -n 1 | wc -l)
-                echo "${p}: present (has_file=${c})"
+                first_file="$(find "${base}/${p}" -type f -print -quit)"
+                if [ -n "${first_file}" ]; then
+                  echo "${p}: present (has_file=1)"
+                else
+                  echo "${p}: present (has_file=0)"
+                fi
               else
                 echo "${p}: missing"
               fi
