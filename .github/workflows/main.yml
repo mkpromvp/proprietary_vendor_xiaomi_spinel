@@ -4,12 +4,12 @@ on:
   workflow_dispatch:
     inputs:
       LINEAGE_BRANCH:
-        description: "Lineage branch for extract utils/tools and device tree"
+        description: "Preferred branch for extract-utils/extract-tools/device-tree"
         required: false
         default: "lineage-23.2"
         type: string
       PUSH_TO_REPO:
-        description: "Push generated blobs to current branch"
+        description: "Push generated tree to current branch"
         required: false
         default: true
         type: boolean
@@ -23,6 +23,7 @@ jobs:
     env:
       DUMP_REPO: https://gitlab.com/mkpromvp/Stock_room_dumb.git
       DUMP_BRANCH: dump-redmi-spinel-os3.0.301.0.wpgmixm
+      DUMP_SUBDIR: .
       DEVICE_TREE_REPO: https://github.com/mkpromvp/android_device_xiaomi_spinel.git
 
     steps:
@@ -36,10 +37,10 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends \
             git python3 python3-pip unzip brotli \
-            openjdk-21-jdk-headless patchelf erofs-utils p7zip-full \
-            android-sdk-libsparse-utils
+            openjdk-21-jdk-headless p7zip-full erofs-utils \
+            android-sdk-libsparse-utils llvm
 
-      - name: Clone extract utils/tools
+      - name: Clone extract utils/tools with fallback
         run: |
           set -e
           clone_with_fallback() {
@@ -50,6 +51,7 @@ jobs:
             local branches=("${preferred}" "$@")
             for b in "${branches[@]}"; do
               if git ls-remote --exit-code --heads "${repo_url}" "${b}" >/dev/null 2>&1; then
+                echo "Using ${repo_url} @ ${b}"
                 git clone --depth=1 -b "${b}" "${repo_url}" "${dst}"
                 return 0
               fi
@@ -70,50 +72,168 @@ jobs:
             "${{ inputs.LINEAGE_BRANCH }}" \
             "lineage-23.2" "lineage-23.0" "lineage-22.2"
 
-      - name: Clone device tree and dump
+      - name: Clone device tree
         run: |
+          set -e
           git clone --depth=1 -b "${{ inputs.LINEAGE_BRANCH }}" "${DEVICE_TREE_REPO}" android/device/xiaomi/spinel || \
-          git clone --depth=1 -b lineage-23.2 "${DEVICE_TREE_REPO}" android/device/xiaomi/spinel
+          git clone --depth=1 -b "lineage-23.2" "${DEVICE_TREE_REPO}" android/device/xiaomi/spinel
 
+      - name: Clone dump
+        run: |
           git clone --depth=1 -b "${DUMP_BRANCH}" "${DUMP_REPO}" stock_dump
 
       - name: Prepare unpacked dump
         run: |
           set -e
-          mkdir -p prepared_dump
-          for p in system vendor product system_ext odm; do
-            if [ -d "stock_dump/${p}" ]; then
-              mkdir -p "prepared_dump/${p}"
-              cp -a "stock_dump/${p}/." "prepared_dump/${p}/"
-            fi
-          done
-          mkdir -p prepared_dump/system
-          for p in vendor product system_ext odm; do
-            if [ -d "prepared_dump/${p}" ] && [ ! -e "prepared_dump/system/${p}" ]; then
-              ln -sf "../${p}" "prepared_dump/system/${p}"
+          ROOT="$(pwd)"
+          SRC_DIR="${ROOT}/stock_dump/${DUMP_SUBDIR}"
+          OUT_DIR="${ROOT}/prepared_dump"
+          mkdir -p "${OUT_DIR}"
+
+          # copy all likely partitions used by proprietary-files/device tree
+          for p in system vendor product system_ext odm mi_ext bin vendor_dlkm system_dlkm odm_dlkm; do
+            if [ -d "${SRC_DIR}/${p}" ]; then
+              mkdir -p "${OUT_DIR}/${p}"
+              cp -a "${SRC_DIR}/${p}/." "${OUT_DIR}/${p}/"
             fi
           done
 
-          if [ ! -d prepared_dump/system ] || [ -z "$(find prepared_dump/system -mindepth 1 -print -quit)" ]; then
+          mkdir -p "${OUT_DIR}/system"
+          for p in vendor product system_ext odm mi_ext; do
+            if [ -d "${OUT_DIR}/${p}" ] && [ ! -e "${OUT_DIR}/system/${p}" ]; then
+              ln -sf "../${p}" "${OUT_DIR}/system/${p}"
+            fi
+          done
+
+          if [ ! -d "${OUT_DIR}/system" ] || [ -z "$(find "${OUT_DIR}/system" -mindepth 1 -print -quit)" ]; then
             echo "::error::No unpacked system content found in dump"
             exit 1
           fi
 
-      - name: Extract blobs + regenerate makefiles
+      - name: Add prebuilt path shims expected by extract-utils
+        run: |
+          set -e
+          ROOT="$(pwd)/android"
+
+          mkdir -p "${ROOT}/prebuilts/jdk/jdk21/linux-x86/bin"
+          ln -sf "$(command -v java)" "${ROOT}/prebuilts/jdk/jdk21/linux-x86/bin/java"
+
+          mkdir -p "${ROOT}/prebuilts/clang/host/linux-x86/llvm-binutils-stable"
+          if command -v llvm-objdump >/dev/null 2>&1; then
+            ln -sf "$(command -v llvm-objdump)" "${ROOT}/prebuilts/clang/host/linux-x86/llvm-binutils-stable/llvm-objdump"
+          fi
+
+      - name: Direct proprietary-files extraction (primary mode)
+        run: |
+          set -e
+          ROOT="$(pwd)"
+          SRC_DIR="${ROOT}/stock_dump/${DUMP_SUBDIR}"
+          DUMP_ROOT="${ROOT}/prepared_dump"
+          DUMP_SYSTEM="${ROOT}/prepared_dump/system"
+          TARGET="${ROOT}/android/vendor/xiaomi/spinel"
+          PROP_LIST="$(find "${SRC_DIR}" -maxdepth 6 -type f -name proprietary-files.txt | head -n 1 || true)"
+
+          if [ -n "${PROP_LIST}" ]; then
+            echo "Using direct extraction mode from ${PROP_LIST}"
+            mkdir -p "${TARGET}/proprietary"
+            cp -f "${PROP_LIST}" "${TARGET}/proprietary-files.txt"
+
+            copied=0
+            missing=0
+
+            while IFS= read -r raw || [ -n "${raw}" ]; do
+              line="$(echo "${raw}" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+              [ -z "${line}" ] && continue
+              echo "${line}" | grep -q '^#' && continue
+
+              entry="${line#-}"
+              entry="${entry%%;*}"
+              entry="${entry%%|*}"
+
+              src="${entry%%:*}"
+              dst="${entry#*:}"
+              [ "${dst}" = "${entry}" ] && dst="${src}"
+              [ -z "${src}" ] && continue
+
+              src_path=""
+              for c in "${DUMP_ROOT}/${src}" "${DUMP_SYSTEM}/${src}"; do
+                if [ -f "${c}" ] || [ -L "${c}" ]; then
+                  src_path="${c}"
+                  break
+                fi
+              done
+
+              if [ -z "${src_path}" ]; then
+                missing=$((missing + 1))
+                continue
+              fi
+
+              out="${TARGET}/proprietary/${dst}"
+              mkdir -p "$(dirname "${out}")"
+              cp -a "${src_path}" "${out}"
+              copied=$((copied + 1))
+            done < "${PROP_LIST}"
+
+            echo "Copied blobs: ${copied}"
+            echo "Missing blobs: ${missing}"
+
+            if [ "${copied}" -lt 100 ]; then
+              echo "::error::Too few blobs copied in direct mode"
+              exit 1
+            fi
+
+            echo "USED_DIRECT_MODE=1" >> "${GITHUB_ENV}"
+          else
+            echo "USED_DIRECT_MODE=0" >> "${GITHUB_ENV}"
+          fi
+
+      - name: Fallback extract-files.py mode
+        if: env.USED_DIRECT_MODE != '1'
         run: |
           set -e
           cd android/device/xiaomi/spinel
-          PYTHONPATH=../../../tools/extract-utils python3 extract-files.py "${GITHUB_WORKSPACE}/prepared_dump"
+          PYTHONPATH=../../../tools/extract-utils python3 extract-files.py "$(pwd)/../../../prepared_dump"
           PYTHONPATH=../../../tools/extract-utils python3 extract-files.py --regenerate_makefiles
+
+      - name: Ensure root makefiles exist
+        run: |
+          set -e
+          TARGET="android/vendor/xiaomi/spinel"
+
+          [ -f "${TARGET}/Android.bp" ] || cat > "${TARGET}/Android.bp" <<'EOF'
+          soong_namespace {
+          }
+          EOF
+
+          [ -f "${TARGET}/Android.mk" ] || cat > "${TARGET}/Android.mk" <<'EOF'
+          LOCAL_PATH := $(call my-dir)
+
+          ifneq ($(filter spinel,$(TARGET_DEVICE)),)
+          include $(call all-makefiles-under,$(LOCAL_PATH))
+          endif
+          EOF
+
+          [ -f "${TARGET}/BoardConfigVendor.mk" ] || cat > "${TARGET}/BoardConfigVendor.mk" <<'EOF'
+          BOARD_VENDOR := xiaomi
+          EOF
+
+          [ -f "${TARGET}/spinel-vendor.mk" ] || cat > "${TARGET}/spinel-vendor.mk" <<'EOF'
+          # Auto-generated placeholder
+          PRODUCT_COPY_FILES +=
+          EOF
 
       - name: Validate output
         run: |
           set -e
-          cd android/vendor/xiaomi/spinel
-          test -f proprietary-files.txt
-          test -f spinel-vendor.mk
-          test -d proprietary
-          COUNT=$(find proprietary -type f | wc -l)
+          TARGET="android/vendor/xiaomi/spinel"
+          test -f "${TARGET}/proprietary-files.txt"
+          test -f "${TARGET}/Android.bp"
+          test -f "${TARGET}/Android.mk"
+          test -f "${TARGET}/BoardConfigVendor.mk"
+          test -f "${TARGET}/spinel-vendor.mk"
+          test -d "${TARGET}/proprietary"
+
+          COUNT=$(find "${TARGET}/proprietary" -type f | wc -l)
           echo "Blob files: ${COUNT}"
           [ "${COUNT}" -gt 100 ] || (echo "::error::Too few blobs" && exit 1)
 
@@ -125,7 +245,7 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add -A
           if git diff --cached --quiet; then
-            echo "No changes"
+            echo "No changes to commit"
           else
             git commit -m "vendor: spinel: regenerate from Stock_room_dumb"
             git push origin "HEAD:${GITHUB_REF_NAME}"
