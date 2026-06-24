@@ -320,6 +320,12 @@ jobs:
         run: |
           set -euo pipefail
           TARGET="android/vendor/xiaomi/spinel"
+          DEV_DIR="android/device/xiaomi/spinel"
+
+          # Some extract-utils revisions don't refresh this file in vendor.
+          if [ ! -f "${TARGET}/proprietary-files.txt" ] && [ -f "${DEV_DIR}/proprietary-files.txt" ]; then
+            cp -f "${DEV_DIR}/proprietary-files.txt" "${TARGET}/proprietary-files.txt"
+          fi
 
           for f in proprietary-files.txt Android.bp Android.mk BoardConfigVendor.mk spinel-vendor.mk; do
             test -f "${TARGET}/${f}" || (echo "::error::Missing ${f}" && exit 1)
