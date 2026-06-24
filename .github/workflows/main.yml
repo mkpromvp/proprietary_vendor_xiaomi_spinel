@@ -4,15 +4,29 @@ on:
   workflow_dispatch:
     inputs:
       LINEAGE_BRANCH:
-        description: "Branch for extract-utils/extract-tools/device-tree"
+        description: Branch for extract-utils and extract-tools
         required: false
-        default: "lineage-23.2"
+        default: lineage-23.2
+        type: string
+      DEVICE_TREE_BRANCH:
+        description: Branch for android_device_xiaomi_spinel
+        required: false
+        default: lineage-23.2
+        type: string
+      DUMP_BRANCH:
+        description: Dump branch in Stock_room_dumb
+        required: false
+        default: dump-redmi-spinel-os3.0.301.0.wpgmixm
         type: string
       PUSH_TO_REPO:
-        description: "Push generated tree to current branch"
+        description: Push generated vendor tree to current branch
         required: false
         default: true
         type: boolean
+
+concurrency:
+  group: spinel-vendor-${{ github.ref_name }}
+  cancel-in-progress: true
 
 jobs:
   build-vendor:
@@ -22,27 +36,27 @@ jobs:
       contents: write
     env:
       DUMP_REPO: https://gitlab.com/mkpromvp/Stock_room_dumb.git
-      DUMP_BRANCH: dump-redmi-spinel-os3.0.301.0.wpgmixm
-      DUMP_SUBDIR: .
       DEVICE_TREE_REPO: https://github.com/mkpromvp/android_device_xiaomi_spinel.git
 
     steps:
       - name: Checkout vendor repository
         uses: actions/checkout@v4
         with:
+          fetch-depth: 0
           path: android/vendor/xiaomi/spinel
 
       - name: Install dependencies
         run: |
+          set -euo pipefail
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends \
             git python3 python3-pip unzip brotli \
             openjdk-21-jdk-headless p7zip-full erofs-utils \
-            android-sdk-libsparse-utils llvm
+            android-sdk-libsparse-utils llvm rsync
 
       - name: Clone extract utils/tools with fallback
         run: |
-          set -e
+          set -euo pipefail
           clone_with_fallback() {
             local repo_url="$1"
             local dst="$2"
@@ -72,36 +86,62 @@ jobs:
             "${{ inputs.LINEAGE_BRANCH }}" \
             "lineage-23.2" "lineage-23.0" "lineage-22.2"
 
-      - name: Clone device tree
+      - name: Clone device tree with fallback
         run: |
-          set -e
-          git clone --depth=1 -b "${{ inputs.LINEAGE_BRANCH }}" "${DEVICE_TREE_REPO}" android/device/xiaomi/spinel || \
-          git clone --depth=1 -b "lineage-23.2" "${DEVICE_TREE_REPO}" android/device/xiaomi/spinel
+          set -euo pipefail
+          clone_with_fallback() {
+            local repo_url="$1"
+            local dst="$2"
+            local preferred="$3"
+            shift 3
+            local branches=("${preferred}" "$@")
+            for b in "${branches[@]}"; do
+              if git ls-remote --exit-code --heads "${repo_url}" "${b}" >/dev/null 2>&1; then
+                echo "Using ${repo_url} @ ${b}"
+                git clone --depth=1 -b "${b}" "${repo_url}" "${dst}"
+                return 0
+              fi
+            done
+            echo "::error::No valid branch found for ${repo_url}"
+            exit 1
+          }
+
+          clone_with_fallback \
+            "${DEVICE_TREE_REPO}" \
+            "android/device/xiaomi/spinel" \
+            "${{ inputs.DEVICE_TREE_BRANCH }}" \
+            "lineage-23.2" "lineage-23.0" "lineage-22.2"
 
       - name: Clone dump
         run: |
-          git clone --depth=1 -b "${DUMP_BRANCH}" "${DUMP_REPO}" stock_dump
+          set -euo pipefail
+          git clone --depth=1 -b "${{ inputs.DUMP_BRANCH }}" "${DUMP_REPO}" stock_dump
 
       - name: Prepare unpacked dump
         run: |
-          set -e
+          set -euo pipefail
           ROOT="$(pwd)"
-          SRC_DIR="${ROOT}/stock_dump/${DUMP_SUBDIR}"
+
+          SRC_DIR="${ROOT}/stock_dump"
+          if [ -d "${ROOT}/stock_dump/extracted/system" ]; then
+            SRC_DIR="${ROOT}/stock_dump/extracted"
+          fi
+
           OUT_DIR="${ROOT}/prepared_dump"
           mkdir -p "${OUT_DIR}"
 
-          # Copy all relevant unpacked partitions
           for p in system vendor product system_ext odm mi_ext vendor_dlkm system_dlkm odm_dlkm; do
             if [ -d "${SRC_DIR}/${p}" ]; then
               mkdir -p "${OUT_DIR}/${p}"
-              cp -a "${SRC_DIR}/${p}/." "${OUT_DIR}/${p}/"
+              rsync -a "${SRC_DIR}/${p}/" "${OUT_DIR}/${p}/"
             fi
           done
 
+          # extract-utils expects cross-partition visibility from /system as well.
           mkdir -p "${OUT_DIR}/system"
           for p in vendor product system_ext odm mi_ext; do
             if [ -d "${OUT_DIR}/${p}" ] && [ ! -e "${OUT_DIR}/system/${p}" ]; then
-              ln -sf "../${p}" "${OUT_DIR}/system/${p}"
+              ln -s "../${p}" "${OUT_DIR}/system/${p}"
             fi
           done
 
@@ -110,21 +150,49 @@ jobs:
             exit 1
           fi
 
-      - name: Patch proprietary lists for this dump
+          echo "Prepared dump from: ${SRC_DIR}"
+
+      - name: Patch and prune proprietary lists for this dump
         run: |
-          set -e
+          set -euo pipefail
           DEV_DIR="android/device/xiaomi/spinel"
+          PREPARED="$(pwd)/prepared_dump"
 
-          # Fix known wrong path in list
-          if [ -f "${DEV_DIR}/proprietary-files.txt" ]; then
-            sed -i 's#^bin/iwpriv#vendor/bin/iwpriv#' "${DEV_DIR}/proprietary-files.txt"
-
-            # Remove known empty placeholders from this dump
-            sed -i '/^mi_ext\/system_ext\/app\/MtkCalendar\/MtkCalendar\.apk$/d' "${DEV_DIR}/proprietary-files.txt"
-            sed -i '/^mi_ext\/system_ext\/priv-app\/MtkContacts\/MtkContacts\.apk$/d' "${DEV_DIR}/proprietary-files.txt"
+          if [ ! -f "${DEV_DIR}/proprietary-files.txt" ]; then
+            echo "::error::Missing proprietary-files.txt in device tree"
+            exit 1
           fi
 
-          # Remove missing firmware image entries that are not present in this dump
+          sed -i 's#^bin/iwpriv#vendor/bin/iwpriv#' "${DEV_DIR}/proprietary-files.txt"
+
+          # Remove known empty placeholders from this dump.
+          sed -i '/^mi_ext\/system_ext\/app\/MtkCalendar\/MtkCalendar\.apk$/d' "${DEV_DIR}/proprietary-files.txt"
+          sed -i '/^mi_ext\/system_ext\/priv-app\/MtkContacts\/MtkContacts\.apk$/d' "${DEV_DIR}/proprietary-files.txt"
+
+          # Keep comments/directives as-is, but drop entries that do not exist in this dump.
+          tmp_list="$(mktemp)"
+          while IFS= read -r line || [ -n "$line" ]; do
+            case "$line" in
+              ""|\#*|-\#*|:*)
+                echo "$line" >> "${tmp_list}"
+                continue
+                ;;
+            esac
+
+            entry="${line#-}"
+            if [ "${entry#\?}" != "${entry}" ]; then
+              entry="${entry#\?}"
+            fi
+            entry="${entry%%;*}"
+            src="${entry%%:*}"
+
+            if [ -e "${PREPARED}/${src}" ]; then
+              echo "$line" >> "${tmp_list}"
+            fi
+          done < "${DEV_DIR}/proprietary-files.txt"
+
+          mv "${tmp_list}" "${DEV_DIR}/proprietary-files.txt"
+
           if [ -f "${DEV_DIR}/proprietary-firmware.txt" ]; then
             cp -f "${DEV_DIR}/proprietary-firmware.txt" "${DEV_DIR}/proprietary-firmware.txt.bak"
             grep -Ev '^(dpm|gz|lk|mcupm|md1img|pi_img|preloader_raw|scp|spmfw|sspm|tee)\.img$' \
@@ -133,7 +201,7 @@ jobs:
 
       - name: Add toolchain path shims expected by extract-utils
         run: |
-          set -e
+          set -euo pipefail
           ROOT="$(pwd)/android"
 
           mkdir -p "${ROOT}/prebuilts/jdk/jdk21/linux-x86/bin"
@@ -144,38 +212,63 @@ jobs:
             ln -sf "$(command -v llvm-objdump)" "${ROOT}/prebuilts/clang/host/linux-x86/llvm-binutils-stable/llvm-objdump"
           fi
 
-      - name: Run extraction + regenerate makefiles
+      - name: Run extraction and regenerate makefiles
         run: |
-          set -e
+          set -euo pipefail
           cd android/device/xiaomi/spinel
+
+          test -f extract-files.py
+          test -f setup-makefiles.py
+
           PYTHONPATH=../../../tools/extract-utils python3 extract-files.py "$(pwd)/../../../prepared_dump"
-          PYTHONPATH=../../../tools/extract-utils python3 extract-files.py --regenerate_makefiles
+          PYTHONPATH=../../../tools/extract-utils python3 setup-makefiles.py
 
-      - name: Validate output
+      - name: Validate generated vendor tree
         run: |
-          set -e
+          set -euo pipefail
           TARGET="android/vendor/xiaomi/spinel"
-          test -f "${TARGET}/proprietary-files.txt"
-          test -f "${TARGET}/Android.bp"
-          test -f "${TARGET}/Android.mk"
-          test -f "${TARGET}/BoardConfigVendor.mk"
-          test -f "${TARGET}/spinel-vendor.mk"
-          test -d "${TARGET}/proprietary"
 
-          COUNT=$(find "${TARGET}/proprietary" -type f | wc -l)
-          echo "Blob files: ${COUNT}"
-          [ "${COUNT}" -gt 100 ] || (echo "::error::Too few blobs" && exit 1)
+          for f in proprietary-files.txt Android.bp Android.mk BoardConfigVendor.mk spinel-vendor.mk; do
+            test -f "${TARGET}/${f}" || (echo "::error::Missing ${f}" && exit 1)
+          done
+          test -d "${TARGET}/proprietary" || (echo "::error::Missing proprietary blob directory" && exit 1)
+
+          if grep -q "Auto-generated placeholder" "${TARGET}/spinel-vendor.mk"; then
+            echo "::error::spinel-vendor.mk is still a placeholder"
+            exit 1
+          fi
+
+          BLOB_COUNT=$(find "${TARGET}/proprietary" -type f | wc -l)
+          PF_LINES=$(grep -Ecv '^(#|$)' "${TARGET}/proprietary-files.txt")
+          VENDOR_MK_LINES=$(wc -l < "${TARGET}/spinel-vendor.mk")
+
+          echo "Blob files: ${BLOB_COUNT}"
+          echo "proprietary-files entries: ${PF_LINES}"
+          echo "spinel-vendor.mk lines: ${VENDOR_MK_LINES}"
+
+          [ "${BLOB_COUNT}" -gt 100 ] || (echo "::error::Too few blobs" && exit 1)
+          [ "${PF_LINES}" -gt 500 ] || (echo "::error::Too few proprietary entries" && exit 1)
+          [ "${VENDOR_MK_LINES}" -gt 30 ] || (echo "::error::Generated vendor mk looks incomplete" && exit 1)
+
+      - name: Upload generated vendor tree as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: spinel-vendor-tree-${{ inputs.DUMP_BRANCH }}
+          path: android/vendor/xiaomi/spinel
+          if-no-files-found: error
 
       - name: Commit and push
         if: ${{ inputs.PUSH_TO_REPO }}
         run: |
+          set -euo pipefail
           cd android/vendor/xiaomi/spinel
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add -A
           if git diff --cached --quiet; then
             echo "No changes to commit"
-          else
-            git commit -m "vendor: spinel: regenerate from Stock_room_dumb"
-            git push origin "HEAD:${GITHUB_REF_NAME}"
+            exit 0
           fi
+
+          git commit -m "vendor: spinel: regenerate from ${{ inputs.DUMP_BRANCH }}"
+          git push origin "HEAD:${GITHUB_REF_NAME}"
