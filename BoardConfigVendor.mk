@@ -1,1 +1,3 @@
-BOARD_VENDOR := xiaomi
+#
+# Automatically generated file. DO NOT MODIFY
+#

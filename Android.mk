@@ -1,5 +1,5 @@
-LOCAL_PATH := $(call my-dir)
+#
+# Automatically generated file. DO NOT MODIFY
+#
 
-ifneq ($(filter spinel,$(TARGET_DEVICE)),)
-include $(call all-makefiles-under,$(LOCAL_PATH))
-endif
+LOCAL_PATH := $(call my-dir)
