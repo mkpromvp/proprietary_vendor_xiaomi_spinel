@@ -199,8 +199,9 @@ jobs:
             fi
           done
 
-          if [ -z "$(find "${OUT_DIR}" -mindepth 2 -print -quit)" ]; then
-            echo "::error::Prepared dump is empty"
+          # OUT_DIR mainly contains symlinks, so follow links while validating.
+          if [ -z "$(find -L "${OUT_DIR}" -type f -print -quit)" ]; then
+            echo "::error::Prepared dump is empty after linking partitions"
             exit 1
           fi
 
