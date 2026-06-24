@@ -42,20 +42,32 @@ jobs:
             git rsync python3 python3-pip jq \
             patchelf openjdk-21-jre-headless openjdk-21-jdk-headless
 
-      - name: Prepare required prebuilts paths (patchelf + java)
+      - name: Prepare prebuilts (extract-tools + java + patchelf)
         run: |
           set -e
 
-          # patchelf paths expected by extract-utils
+          mkdir -p "$LOS_ROOT/prebuilts"
+
+          # Contains apktool.jar and extract helper binaries
+          git clone --depth=1 \
+            https://github.com/LineageOS/android_prebuilts_extract-tools \
+            "$LOS_ROOT/prebuilts/extract-tools"
+
+          # java path expected by extract-utils
+          mkdir -p "$LOS_ROOT/prebuilts/jdk/jdk21/linux-x86/bin"
+          ln -sf "$(command -v java)"  "$LOS_ROOT/prebuilts/jdk/jdk21/linux-x86/bin/java"
+          ln -sf "$(command -v javac)" "$LOS_ROOT/prebuilts/jdk/jdk21/linux-x86/bin/javac"
+
+          # patchelf names expected by extract-utils
           mkdir -p "$LOS_ROOT/prebuilts/extract-tools/linux-x86/bin"
           PATCHELF_BIN="$(command -v patchelf)"
           ln -sf "$PATCHELF_BIN" "$LOS_ROOT/prebuilts/extract-tools/linux-x86/bin/patchelf-0_18"
           ln -sf "$PATCHELF_BIN" "$LOS_ROOT/prebuilts/extract-tools/linux-x86/bin/patchelf-0_17_2"
 
-          # java path expected by extract-utils/apktool
-          mkdir -p "$LOS_ROOT/prebuilts/jdk/jdk21/linux-x86/bin"
-          ln -sf "$(command -v java)"  "$LOS_ROOT/prebuilts/jdk/jdk21/linux-x86/bin/java"
-          ln -sf "$(command -v javac)" "$LOS_ROOT/prebuilts/jdk/jdk21/linux-x86/bin/javac"
+          # hard checks
+          test -f "$LOS_ROOT/prebuilts/extract-tools/common/apktool/apktool.jar"
+          test -x "$LOS_ROOT/prebuilts/jdk/jdk21/linux-x86/bin/java"
+          test -x "$LOS_ROOT/prebuilts/extract-tools/linux-x86/bin/patchelf-0_18"
 
       - name: Clone device tree
         run: |
@@ -138,7 +150,6 @@ jobs:
           paths_file = os.environ["PATHS_FILE"]
           ref = os.environ["DUMP_REF"]
           proj = os.environ["GITLAB_PROJECT_ENC"]
-
           api_files = f"https://gitlab.com/api/v4/projects/{proj}/repository/files"
 
           def fetch(remote):
@@ -160,7 +171,6 @@ jobs:
           if os.path.exists(all_file):
               with open(all_file, "r", encoding="utf-8", errors="ignore") as f:
                   all_paths = [x.strip() for x in f if x.strip()]
-
           all_set = set(all_paths)
 
           fixed = 0
@@ -182,9 +192,8 @@ jobs:
 
                   ok = False
                   for c in cands:
-                      # Allow direct candidate and basename fallback hits
                       if c not in all_set and c not in [p, f"vendor/{p}", f"system/system/{p}", f"product/{p}", f"system_ext/{p}", f"mi_ext/{p}"]:
-                        continue
+                          continue
                       try:
                           data = fetch(c)
                           os.makedirs(os.path.dirname(local), exist_ok=True)
@@ -222,20 +231,20 @@ jobs:
           fw = Path("proprietary-firmware.txt")
           allf = Path(os.environ["DUMP_DIR"]) / "all_files.txt"
 
-          # Fix invalid '-' for packages
+          # fix invalid '-' before package-like entries
           if pf.exists():
               out = []
               for l in pf.read_text(errors="ignore").splitlines():
                   s = l.strip()
                   if s.startswith("-"):
                       core = s[1:]
-                      check = core.split("|",1)[0].split(":",1)[0]
+                      check = core.split("|", 1)[0].split(":", 1)[0]
                       if re.search(r"\.(apk|jar|apex|xml)$", check):
                           l = l.replace("-", "", 1)
                   out.append(l)
               pf.write_text("\n".join(out) + "\n")
 
-          # Prune firmware lines not present in dump (basename check)
+          # prune firmware entries absent in dump (basename match)
           if fw.exists() and allf.exists():
               base = set()
               for l in allf.read_text(errors="ignore").splitlines():
