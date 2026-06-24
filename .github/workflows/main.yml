@@ -110,7 +110,11 @@ jobs:
           MF="android/tools/extract-utils/extract_utils/makefiles.py"
           # Some proprietary lists include unmatched package paths that are only
           # warnings for our use case; prevent hard-fail assert.
-          sed -i 's/^\s*assert not list(base_file_tree)\s*$/    # assertion disabled in CI for spinel dump/g' "${MF}"
+          sed -i 's/assert not list(base_file_tree)/# assertion disabled in CI for spinel dump/' "${MF}"
+          if grep -n "assert not list(base_file_tree)" "${MF}"; then
+            echo "::error::Failed to patch extract-utils assertion"
+            exit 1
+          fi
 
       - name: Clone dump with sparse checkout
         run: |
@@ -280,13 +284,12 @@ jobs:
           set -euo pipefail
 
           TARGET="android/vendor/xiaomi/spinel"
-          DEV_DIR="android/device/xiaomi/spinel"
 
           mkdir -p "${TARGET}"
 
-          if [ ! -f "${TARGET}/proprietary-files.txt" ] && [ -f "${DEV_DIR}/proprietary-files.txt" ]; then
-            cp -f "${DEV_DIR}/proprietary-files.txt" "${TARGET}/proprietary-files.txt"
-          fi
+          # Keep proprietary-files.txt in device tree only; vendor tree should
+          # stay minimal and contain generated build artifacts + blobs.
+          rm -f "${TARGET}/proprietary-files.txt"
 
           if [ ! -f "${TARGET}/Android.bp" ]; then
             printf 'soong_namespace {\n}\n' > "${TARGET}/Android.bp"
@@ -300,7 +303,7 @@ jobs:
             echo "BOARD_VENDOR := xiaomi" > "${TARGET}/BoardConfigVendor.mk"
           fi
 
-          for f in proprietary-files.txt Android.bp Android.mk BoardConfigVendor.mk spinel-vendor.mk; do
+          for f in Android.bp Android.mk BoardConfigVendor.mk spinel-vendor.mk; do
             test -f "${TARGET}/${f}" || (echo "::error::Missing ${f}" && exit 1)
           done
 
@@ -312,15 +315,12 @@ jobs:
           fi
 
           BLOB_COUNT=$(find "${TARGET}/proprietary" -type f | wc -l)
-          PF_LINES=$(grep -Ecv '^(#|$)' "${TARGET}/proprietary-files.txt")
           VENDOR_MK_LINES=$(wc -l < "${TARGET}/spinel-vendor.mk")
 
           echo "Blob files: ${BLOB_COUNT}"
-          echo "proprietary-files entries: ${PF_LINES}"
           echo "spinel-vendor.mk lines: ${VENDOR_MK_LINES}"
 
           [ "${BLOB_COUNT}" -gt 100 ] || (echo "::error::Too few blobs" && exit 1)
-          [ "${PF_LINES}" -gt 500 ] || (echo "::error::Too few proprietary entries" && exit 1)
           [ "${VENDOR_MK_LINES}" -gt 30 ] || (echo "::error::Generated vendor mk looks incomplete" && exit 1)
 
       - name: Upload generated vendor tree as artifact
