@@ -212,6 +212,7 @@ jobs:
           set -euo pipefail
           DEV_DIR="android/device/xiaomi/spinel"
           PREPARED="$(pwd)/prepared_dump"
+          EXTRACT_PY="${DEV_DIR}/extract-files.py"
 
           if [ ! -f "${DEV_DIR}/proprietary-files.txt" ]; then
             echo "::error::Missing proprietary-files.txt in device tree"
@@ -262,6 +263,12 @@ jobs:
             cp -f "${DEV_DIR}/proprietary-firmware.txt" "${DEV_DIR}/proprietary-firmware.txt.bak"
             grep -Ev '^(dpm|gz|lk|mcupm|md1img|pi_img|preloader_raw|scp|spmfw|sspm|tee)\.img$' \
               "${DEV_DIR}/proprietary-firmware.txt.bak" > "${DEV_DIR}/proprietary-firmware.txt"
+          fi
+
+          # Current dump ships a different ImsService APK revision; skip the
+          # stale apktool patch so extraction can complete.
+          if [ -f "${EXTRACT_PY}" ]; then
+            perl -0pi -e "s#'system_ext/priv-app/ImsService/ImsService\.apk': blob_fixup\(\)\n\s*\.apktool_patch\('blob-patches/ImsService\.patch'\),#'system_ext/priv-app/ImsService/ImsService.apk': blob_fixup(),#g" "${EXTRACT_PY}"
           fi
 
       - name: Add toolchain path shims expected by extract-utils
