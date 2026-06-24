@@ -18,6 +18,11 @@ on:
         required: false
         default: dump-redmi-spinel-os3.0.301.0.wpgmixm
         type: string
+      REQUIRE_FULL_FIRMWARE:
+        description: Require full radio firmware image set (recommended)
+        required: false
+        default: true
+        type: boolean
       PUSH_TO_REPO:
         description: Push generated vendor tree to current branch
         required: false
@@ -104,18 +109,6 @@ jobs:
             "${{ inputs.DEVICE_TREE_BRANCH }}" \
             "lineage-23.2" "lineage-23.0" "lineage-22.2"
 
-      - name: Relax extract-utils strict package assertion
-        run: |
-          set -euo pipefail
-          MF="android/tools/extract-utils/extract_utils/makefiles.py"
-          # Some proprietary lists include unmatched package paths that are only
-          # warnings for our use case; prevent hard-fail assert.
-          sed -i 's/assert not list(base_file_tree)/# assertion disabled in CI for spinel dump/' "${MF}"
-          if grep -n "assert not list(base_file_tree)" "${MF}"; then
-            echo "::error::Failed to patch extract-utils assertion"
-            exit 1
-          fi
-
       - name: Clone dump with sparse checkout
         run: |
           set -euo pipefail
@@ -142,8 +135,32 @@ jobs:
 
           cd stock_dump
           git sparse-checkout set --no-cone \
-            /system/** /vendor/** /product/** /system_ext/** /odm/** /mi_ext/** /vendor_dlkm/** /system_dlkm/** /odm_dlkm/**
+            /system/** /vendor/** /product/** /system_ext/** /odm/** /mi_ext/** /vendor_dlkm/** /system_dlkm/** /odm_dlkm/** \
+            /dpm.img /gz.img /lk.img /mcupm.img /md1img.img /pi_img.img /preloader_raw.img /scp.img /spmfw.img /sspm.img /tee.img
           retry git checkout
+
+      - name: Validate firmware image availability
+        run: |
+          set -euo pipefail
+
+          cd stock_dump
+          req=(dpm.img gz.img lk.img mcupm.img md1img.img pi_img.img preloader_raw.img scp.img spmfw.img sspm.img tee.img)
+          miss=()
+
+          for f in "${req[@]}"; do
+            if [ ! -f "$f" ]; then
+              miss+=("$f")
+            fi
+          done
+
+          if [ "${#miss[@]}" -gt 0 ]; then
+            echo "Missing firmware images: ${miss[*]}"
+            if [ "${{ inputs.REQUIRE_FULL_FIRMWARE }}" = "true" ]; then
+              echo "::error::Full firmware set is required for build-ready vendor tree"
+              exit 1
+            fi
+            echo "::warning::Continuing without full firmware set"
+          fi
 
       - name: Prepare dump directory
         run: |
@@ -173,79 +190,28 @@ jobs:
 
           find -L "${OUT_DIR}" -type f -print -quit >/dev/null || (echo "::error::Prepared dump is empty" && exit 1)
 
-      - name: Patch extraction lists for this dump
+      - name: Preflight proprietary list quality
         run: |
           set -euo pipefail
 
           DEV_DIR="android/device/xiaomi/spinel"
-          PREPARED="$(pwd)/prepared_dump"
+          LIST="${DEV_DIR}/proprietary-files.txt"
+          test -f "${LIST}"
 
-          test -f "${DEV_DIR}/proprietary-files.txt"
+          # Keep one canonical iwpriv entry.
+          sed -i -E '/^[-?]*bin\/iwpriv([:;].*)?$/d; /^[-?]*vendor\/bin\/iwpriv([:;].*)?$/d' "${LIST}"
+          printf '\nvendor/bin/iwpriv\n' >> "${LIST}"
 
-          sed -i -E '/^[-?]*bin\/iwpriv([:;].*)?$/d; /^[-?]*vendor\/bin\/iwpriv([:;].*)?$/d' "${DEV_DIR}/proprietary-files.txt"
-          printf '\nvendor/bin/iwpriv\n' >> "${DEV_DIR}/proprietary-files.txt"
+          # Remove known bad placeholders.
+          sed -i '/^mi_ext\/system_ext\/app\/MtkCalendar\/MtkCalendar\.apk$/d' "${LIST}"
+          sed -i '/^mi_ext\/system_ext\/priv-app\/MtkContacts\/MtkContacts\.apk$/d' "${LIST}"
 
-          sed -i '/^mi_ext\/system_ext\/app\/MtkCalendar\/MtkCalendar\.apk$/d' "${DEV_DIR}/proprietary-files.txt"
-          sed -i '/^mi_ext\/system_ext\/priv-app\/MtkContacts\/MtkContacts\.apk$/d' "${DEV_DIR}/proprietary-files.txt"
-          # Temporary workaround: this dump has a different ImsService smali layout,
-          # so the device blob-patch does not apply cleanly.
-          sed -i -E '/^[-?]*system_ext\/priv-app\/ImsService\/ImsService\.apk([:;].*)?$/d' "${DEV_DIR}/proprietary-files.txt"
-          # This extract-utils branch makefile generator only handles
-          # system/vendor/product/system_ext/odm/recovery partitions.
-          # Drop unsupported partitions to avoid write_product_packages assertion.
-          sed -i -E '/^[-?]*(mi_ext|vendor_dlkm|system_dlkm|odm_dlkm)\//d' "${DEV_DIR}/proprietary-files.txt"
-          # Drop mi_ext paths for this generation pass; they frequently break
-          # makefile package grouping with this extract-utils branch.
-          sed -i -E '/^[-?]*mi_ext\//d' "${DEV_DIR}/proprietary-files.txt"
-
-          TMP_LIST="$(mktemp)"
-          while IFS= read -r line || [ -n "$line" ]; do
-            case "$line" in
-              ""|\#*|:*)
-                echo "$line" >> "${TMP_LIST}"
-                continue
-                ;;
-            esac
-
-            entry="${line#-}"
-            entry="${entry#\?}"
-            entry="${entry%%;*}"
-            src="${entry%%:*}"
-
-            if [ -e "${PREPARED}/${src}" ]; then
-              echo "$line" >> "${TMP_LIST}"
-            fi
-          done < "${DEV_DIR}/proprietary-files.txt"
-
-          mv "${TMP_LIST}" "${DEV_DIR}/proprietary-files.txt"
-
-          sed -i -E '/^[-?]*bin\/iwpriv([:;].*)?$/d; /^[-?]*vendor\/bin\/iwpriv([:;].*)?$/d' "${DEV_DIR}/proprietary-files.txt"
-          printf '\nvendor/bin/iwpriv\n' >> "${DEV_DIR}/proprietary-files.txt"
-          # Strip legacy leading '-' markers from ordinary entries to avoid
-          # extract-utils package assertion issues.
-          sed -i -E 's#^-([[:alnum:]_./].*)#\1#' "${DEV_DIR}/proprietary-files.txt"
-          awk '!seen[$0]++' "${DEV_DIR}/proprietary-files.txt" > "${DEV_DIR}/proprietary-files.txt.tmp"
-          mv "${DEV_DIR}/proprietary-files.txt.tmp" "${DEV_DIR}/proprietary-files.txt"
-
-          if [ -f "${DEV_DIR}/proprietary-firmware.txt" ]; then
-            cp -f "${DEV_DIR}/proprietary-firmware.txt" "${DEV_DIR}/proprietary-firmware.txt.bak"
-            grep -Ev '^(dpm|gz|lk|mcupm|md1img|pi_img|preloader_raw|scp|spmfw|sspm|tee)\.img$' \
-              "${DEV_DIR}/proprietary-firmware.txt.bak" > "${DEV_DIR}/proprietary-firmware.txt"
-            # Avoid makefile hashing on missing radio images in this dump.
-            : > "${DEV_DIR}/proprietary-firmware.txt"
-          fi
-
-          # Force-disable stale ImsService apktool patch with a direct text rewrite.
-          # This dump uses a different smali layout, so patch hunks do not match.
-          if [ -f "${DEV_DIR}/extract-files.py" ]; then
-            sed -i "/system_ext\/priv-app\/ImsService\/ImsService.apk/s/blob_fixup()$/blob_fixup(),/" "${DEV_DIR}/extract-files.py"
-            sed -i "/ImsService\.patch/d" "${DEV_DIR}/extract-files.py"
-            sed -i "s/add_firmware_proprietary_file=True/add_firmware_proprietary_file=False/g" "${DEV_DIR}/extract-files.py"
-            if grep -q "ImsService.patch" "${DEV_DIR}/extract-files.py"; then
-              echo "::error::Failed to neutralize ImsService.patch hook in extract-files.py"
-              grep -n "ImsService.patch" "${DEV_DIR}/extract-files.py" || true
-              exit 1
-            fi
+          # Fail early on unsupported partitions that break makefile generation.
+          BAD="$(grep -nE '^[^-?#:[:space:]]*(mi_ext|vendor_dlkm|system_dlkm|odm_dlkm)/' "${LIST}" || true)"
+          if [ -n "${BAD}" ]; then
+            echo "${BAD}"
+            echo "::error::Unsupported partition entries exist in proprietary-files.txt"
+            exit 1
           fi
 
       - name: Add extract-utils shims
@@ -268,40 +234,28 @@ jobs:
           echo "GIT_AUTHOR_EMAIL=github-actions[bot]@users.noreply.github.com" >> "$GITHUB_ENV"
           echo "GIT_COMMITTER_NAME=github-actions-bot" >> "$GITHUB_ENV"
           echo "GIT_COMMITTER_EMAIL=github-actions[bot]@users.noreply.github.com" >> "$GITHUB_ENV"
-
           git config --global user.name "github-actions-bot"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
 
-      - name: Extract blobs and regenerate makefiles
+      - name: Extract blobs
         run: |
           set -euo pipefail
           cd android/device/xiaomi/spinel
           PYTHONPATH=../../../tools/extract-utils python3 extract-files.py "$(pwd)/../../../../prepared_dump"
+
+      - name: Regenerate makefiles
+        run: |
+          set -euo pipefail
+          cd android/device/xiaomi/spinel
           PYTHONPATH=../../../tools/extract-utils python3 extract-files.py --regenerate_makefiles
 
-      - name: Validate output
+      - name: Validate generated vendor tree
         run: |
           set -euo pipefail
 
           TARGET="android/vendor/xiaomi/spinel"
-
           mkdir -p "${TARGET}"
-
-          # Keep proprietary-files.txt in device tree only; vendor tree should
-          # stay minimal and contain generated build artifacts + blobs.
           rm -f "${TARGET}/proprietary-files.txt"
-
-          if [ ! -f "${TARGET}/Android.bp" ]; then
-            printf 'soong_namespace {\n}\n' > "${TARGET}/Android.bp"
-          fi
-
-          if [ ! -f "${TARGET}/Android.mk" ]; then
-            printf 'LOCAL_PATH := $(call my-dir)\n\nifneq ($(filter spinel,$(TARGET_DEVICE)),)\ninclude $(call all-makefiles-under,$(LOCAL_PATH))\nendif\n' > "${TARGET}/Android.mk"
-          fi
-
-          if [ ! -f "${TARGET}/BoardConfigVendor.mk" ]; then
-            echo "BOARD_VENDOR := xiaomi" > "${TARGET}/BoardConfigVendor.mk"
-          fi
 
           for f in Android.bp Android.mk BoardConfigVendor.mk spinel-vendor.mk; do
             test -f "${TARGET}/${f}" || (echo "::error::Missing ${f}" && exit 1)
