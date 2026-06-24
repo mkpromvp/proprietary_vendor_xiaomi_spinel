@@ -156,6 +156,9 @@ jobs:
 
           sed -i '/^mi_ext\/system_ext\/app\/MtkCalendar\/MtkCalendar\.apk$/d' "${DEV_DIR}/proprietary-files.txt"
           sed -i '/^mi_ext\/system_ext\/priv-app\/MtkContacts\/MtkContacts\.apk$/d' "${DEV_DIR}/proprietary-files.txt"
+          # Temporary workaround: this dump has a different ImsService smali layout,
+          # so the device blob-patch does not apply cleanly.
+          sed -i -E '/^[-?]*system_ext\/priv-app\/ImsService\/ImsService\.apk([:;].*)?$/d' "${DEV_DIR}/proprietary-files.txt"
 
           TMP_LIST="$(mktemp)"
           while IFS= read -r line || [ -n "$line" ]; do
@@ -189,8 +192,16 @@ jobs:
               "${DEV_DIR}/proprietary-firmware.txt.bak" > "${DEV_DIR}/proprietary-firmware.txt"
           fi
 
-          # Disable stale ImsService apktool patch for this dump revision.
-          python3 -c "from pathlib import Path; import re; p=Path('android/device/xiaomi/spinel/extract-files.py'); s=p.read_text(encoding='utf-8'); s=re.sub(r\"'system_ext/priv-app/ImsService/ImsService\\\\.apk':\\s*blob_fixup\\(\\)\\s*\\.apktool_patch\\('blob-patches/ImsService\\\\.patch'\\),\", \"'system_ext/priv-app/ImsService/ImsService.apk': blob_fixup(),\", s, flags=re.S); p.write_text(s, encoding='utf-8')"
+          # Force-disable stale ImsService apktool patch with a direct text rewrite.
+          # This dump uses a different smali layout, so patch hunks do not match.
+          if [ -f "${DEV_DIR}/extract-files.py" ]; then
+            sed -i "s#\.apktool_patch('blob-patches/ImsService\.patch'),#,#g" "${DEV_DIR}/extract-files.py"
+            if grep -q "ImsService.patch" "${DEV_DIR}/extract-files.py"; then
+              echo "::error::Failed to neutralize ImsService.patch hook in extract-files.py"
+              grep -n "ImsService.patch" "${DEV_DIR}/extract-files.py" || true
+              exit 1
+            fi
+          fi
 
       - name: Add extract-utils shims
         run: |
