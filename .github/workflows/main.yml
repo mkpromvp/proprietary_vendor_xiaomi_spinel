@@ -3,12 +3,8 @@ name: Generate Spinel Vendor Tree
 on:
   workflow_dispatch:
     inputs:
-      FIRMWARE_URL:
-        description: "URL to Xiaomi Spinel (Redmi Note 15 4G) firmware ZIP / payload.bin"
-        required: true
-        type: string
       DEVICE_TREE_REPO:
-        description: "Device tree repo (e.g. github.com/username/android_device_xiaomi_spinel)"
+        description: "Device tree repo without https:// (example: github.com/mkpromvp/android_device_xiaomi_spinel)"
         required: true
         type: string
       DEVICE_TREE_BRANCH:
@@ -17,253 +13,166 @@ on:
         default: "lineage-22.2"
         type: string
       LINEAGE_BRANCH:
-        description: "LineageOS branch for extract-utils / extract-tools"
+        description: "Branch for extract-utils and extract-tools"
         required: false
         default: "lineage-22.2"
         type: string
       PUSH_TO_REPO:
-        description: "Push generated vendor tree back to this repo"
+        description: "Push generated tree to this repository"
         required: false
-        default: "true"
+        default: true
         type: boolean
 
 jobs:
   build-vendor:
-    name: Generate Spinel Vendor Tree
+    name: Build Xiaomi Spinel Vendor Tree
     runs-on: ubuntu-latest
-
     permissions:
       contents: write
-
     env:
-      DEVICE: spinel
-      VENDOR: xiaomi
-      LINEAGE_BRANCH: ${{ github.event.inputs.LINEAGE_BRANCH || 'lineage-22.2' }}
+      DUMP_REPO: https://gitlab.com/mkpromvp/Stock_room_dumb.git
+      DUMP_BRANCH: dump-redmi-spinel-os3.0.301.0.wpgmixm
+      DUMP_SUBDIR: .
 
     steps:
-      # ──────────────────────────────────────────────
-      # 1. Checkout this vendor repo
-      # ──────────────────────────────────────────────
-      - name: Checkout vendor repo
+      - name: Checkout vendor repository
         uses: actions/checkout@v4
         with:
           path: android/vendor/xiaomi/spinel
 
-      # ──────────────────────────────────────────────
-      # 2. Install system dependencies
-      # ──────────────────────────────────────────────
       - name: Install dependencies
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends \
-            git curl wget unzip brotli python3 python3-pip \
-            openjdk-21-jdk-headless patchelf aria2 \
-            erofs-utils
+            git python3 python3-pip unzip brotli \
+            openjdk-21-jdk-headless patchelf erofs-utils p7zip-full
 
-      # ──────────────────────────────────────────────
-      # 3. Clone LineageOS extract-utils
-      # ──────────────────────────────────────────────
-      - name: Clone android_tools_extract-utils
+      - name: Clone extract-utils
         run: |
           git clone --depth=1 \
-            -b "${{ env.LINEAGE_BRANCH }}" \
+            -b "${{ inputs.LINEAGE_BRANCH }}" \
             https://github.com/LineageOS/android_tools_extract-utils \
             android/tools/extract-utils
 
-      # ──────────────────────────────────────────────
-      # 4. Clone LineageOS prebuilt extract-tools
-      # ──────────────────────────────────────────────
-      - name: Clone android_prebuilts_extract-tools
+      - name: Clone extract-tools
         run: |
           git clone --depth=1 \
-            -b "${{ env.LINEAGE_BRANCH }}" \
+            -b "${{ inputs.LINEAGE_BRANCH }}" \
             https://github.com/LineageOS/android_prebuilts_extract-tools \
             android/prebuilts/extract-tools
 
-      # ──────────────────────────────────────────────
-      # 5. Clone device tree
-      # ──────────────────────────────────────────────
       - name: Clone device tree
         run: |
-          REPO="https://${{ github.event.inputs.DEVICE_TREE_REPO }}"
-          BRANCH="${{ github.event.inputs.DEVICE_TREE_BRANCH }}"
-          git clone --depth=1 -b "${BRANCH}" "${REPO}" \
+          git clone --depth=1 \
+            -b "${{ inputs.DEVICE_TREE_BRANCH }}" \
+            "https://${{ inputs.DEVICE_TREE_REPO }}" \
             android/device/xiaomi/spinel
 
-      # ──────────────────────────────────────────────
-      # 6. Download firmware
-      # ──────────────────────────────────────────────
-      - name: Download firmware
+      - name: Clone stock dump repository
         run: |
-          mkdir -p firmware
-          aria2c -x 16 -s 16 --dir=firmware --out=firmware.zip \
-            "${{ github.event.inputs.FIRMWARE_URL }}"
+          git clone --depth=1 \
+            -b "${DUMP_BRANCH}" \
+            "${DUMP_REPO}" \
+            stock_dump
 
-      # ──────────────────────────────────────────────
-      # 7. Extract firmware (ZIP → payload.bin or direct images)
-      # ──────────────────────────────────────────────
-      - name: Extract firmware
-        run: |
-          mkdir -p dump
-          cd firmware
-
-          # Check if it is already a payload.bin
-          if file firmware.zip | grep -q "Zip archive"; then
-            unzip -o firmware.zip -d fw_extracted
-            if [ -f fw_extracted/payload.bin ]; then
-              cp fw_extracted/payload.bin ../dump/payload.bin
-            else
-              # Flat zip with raw images
-              cp -r fw_extracted/* ../dump/
-            fi
-          else
-            # Treat input as direct payload.bin
-            cp firmware.zip ../dump/payload.bin
-          fi
-
-      # ──────────────────────────────────────────────
-      # 8. Extract payload.bin (A/B OTA)
-      # ──────────────────────────────────────────────
-      - name: Extract payload.bin partitions
-        run: |
-          if [ -f dump/payload.bin ]; then
-            pip3 install --quiet payload-dumper-go 2>/dev/null || true
-            # Use the extract-tools ota_extractor if present
-            OTA_EXTRACTOR="android/prebuilts/extract-tools/linux-x86/bin/ota_extractor"
-            if [ -f "${OTA_EXTRACTOR}" ]; then
-              chmod +x "${OTA_EXTRACTOR}"
-              for PART in system vendor odm product system_ext; do
-                "${OTA_EXTRACTOR}" \
-                  --payload dump/payload.bin \
-                  --output_dir dump \
-                  --partitions "${PART}" || true
-              done
-            else
-              # Fallback: python payload-dumper
-              pip3 install --quiet payload_dumper || true
-              python3 -c "
-          import payload_dumper
-          payload_dumper.main(['dump/payload.bin', '--out', 'dump'])
-          " || true
-            fi
-          fi
-
-      # ──────────────────────────────────────────────
-      # 9. Mount / extract partition images
-      # ──────────────────────────────────────────────
-      - name: Mount partition images
-        run: |
-          mkdir -p system_dump
-
-          for PART in system vendor odm product system_ext; do
-            IMG="dump/${PART}.img"
-            if [ ! -f "${IMG}" ]; then
-              continue
-            fi
-
-            DEST="system_dump/${PART}"
-            mkdir -p "${DEST}"
-
-            # Try EROFS first (MediaTek HyperOS / Android 13+)
-            if file "${IMG}" | grep -q "EROFS"; then
-              fsck.erofs --extract="${DEST}" "${IMG}"
-            elif file "${IMG}" | grep -q "Android sparse"; then
-              SIMG2IMG="android/prebuilts/extract-tools/linux-x86/bin/simg2img"
-              if [ -f "${SIMG2IMG}" ]; then
-                chmod +x "${SIMG2IMG}"
-                "${SIMG2IMG}" "${IMG}" "${IMG}.raw"
-              else
-                simg2img "${IMG}" "${IMG}.raw" 2>/dev/null || cp "${IMG}" "${IMG}.raw"
-              fi
-              sudo mount -o ro,loop "${IMG}.raw" "${DEST}" || \
-                (mkdir -p "${DEST}" && cp -a "${IMG}.raw" "${DEST}/" && true)
-            elif file "${IMG}" | grep -q "ext[234]"; then
-              sudo mount -o ro,loop "${IMG}" "${DEST}" || \
-                (7z x -o"${DEST}" "${IMG}" -y > /dev/null 2>&1 || true)
-            else
-              echo "Unknown FS for ${IMG}, trying ext2fuse..."
-              7z x -o"${DEST}" "${IMG}" -y > /dev/null 2>&1 || true
-            fi
-          done
-
-          # Merge sub-partitions into system_dump root
-          for PART in vendor odm product system_ext; do
-            if [ -d "system_dump/${PART}" ] && [ ! -L "system_dump/system/${PART}" ]; then
-              ln -sf "../../${PART}" "system_dump/system/${PART}" 2>/dev/null || true
-            fi
-          done
-
-      # ──────────────────────────────────────────────
-      # 10. Prepare vendor output directory
-      # ──────────────────────────────────────────────
-      - name: Prepare vendor output dir
-        run: |
-          mkdir -p android/vendor/xiaomi/spinel
-
-      # ──────────────────────────────────────────────
-      # 11. Run extract-files script
-      # ──────────────────────────────────────────────
-      - name: Run extract-files
+      - name: Prepare dump source
         run: |
           set -e
-          DEVICE_DIR="android/device/xiaomi/spinel"
-          ANDROID_ROOT="$(pwd)/android"
-          DUMP_DIR="$(pwd)/system_dump/system"
+          ROOT="$(pwd)"
+          SRC_DIR="${ROOT}/stock_dump/${DUMP_SUBDIR}"
+          OUT_DIR="${ROOT}/prepared_dump"
+          mkdir -p "${OUT_DIR}" "${OUT_DIR}/system"
 
-          # Make scripts executable
-          chmod +x "${DEVICE_DIR}/extract-files.sh"    2>/dev/null || true
-          chmod +x "${DEVICE_DIR}/setup-makefiles.sh"  2>/dev/null || true
-          chmod +x "${DEVICE_DIR}/extract-files.py"    2>/dev/null || true
-          chmod +x "${DEVICE_DIR}/setup-makefiles.py"  2>/dev/null || true
-
-          # Prefer Python (LineageOS 22+) script if available
-          if [ -f "${DEVICE_DIR}/extract-files.py" ]; then
-            cd "${DEVICE_DIR}"
-            PYTHONPATH="${ANDROID_ROOT}/tools/extract-utils" \
-              python3 extract-files.py "${DUMP_DIR}"
-          elif [ -f "${DEVICE_DIR}/extract-files.sh" ]; then
-            cd "${DEVICE_DIR}"
-            bash extract-files.sh "${DUMP_DIR}"
-          else
-            echo "::error::No extract-files script found in device tree!"
+          if [ ! -d "${SRC_DIR}" ]; then
+            echo "::error::Dump path does not exist: ${SRC_DIR}"
             exit 1
           fi
 
-      # ──────────────────────────────────────────────
-      # 12. Unmount images (cleanup)
-      # ──────────────────────────────────────────────
-      - name: Unmount images
-        if: always()
-        run: |
-          for PART in system vendor odm product system_ext; do
-            sudo umount "system_dump/${PART}" 2>/dev/null || true
+          # Copy partition folders if they already exist.
+          for part in system vendor product odm system_ext; do
+            if [ -d "${SRC_DIR}/${part}" ]; then
+              mkdir -p "${OUT_DIR}/${part}"
+              cp -a "${SRC_DIR}/${part}/." "${OUT_DIR}/${part}/"
+            fi
           done
 
-      # ──────────────────────────────────────────────
-      # 13. Show output summary
-      # ──────────────────────────────────────────────
-      - name: Show vendor tree summary
-        run: |
-          echo "=== Generated Vendor Tree ==="
-          find android/vendor/xiaomi/spinel -type f | head -80 || true
-          echo ""
-          echo "Total files: $(find android/vendor/xiaomi/spinel -type f | wc -l)"
+          SIMG2IMG="${ROOT}/android/prebuilts/extract-tools/linux-x86/bin/simg2img"
+          chmod +x "${SIMG2IMG}" || true
 
-      # ──────────────────────────────────────────────
-      # 14. Commit and push vendor tree
-      # ──────────────────────────────────────────────
-      - name: Commit and push vendor tree
-        if: ${{ github.event.inputs.PUSH_TO_REPO == 'true' }}
+          # Extract image partitions when present.
+          for part in system vendor product odm system_ext; do
+            IMG="${SRC_DIR}/${part}.img"
+            [ -f "${IMG}" ] || continue
+
+            DEST="${OUT_DIR}/${part}"
+            mkdir -p "${DEST}"
+
+            if file "${IMG}" | grep -q "EROFS"; then
+              fsck.erofs --extract="${DEST}" "${IMG}" || true
+              continue
+            fi
+
+            RAW_IMG="${IMG}.raw"
+            if file "${IMG}" | grep -q "Android sparse"; then
+              "${SIMG2IMG}" "${IMG}" "${RAW_IMG}" || true
+            else
+              cp "${IMG}" "${RAW_IMG}"
+            fi
+
+            sudo mount -o ro,loop "${RAW_IMG}" "${DEST}" || (7z x -o"${DEST}" "${RAW_IMG}" -y >/dev/null 2>&1 || true)
+          done
+
+          if [ -d "${OUT_DIR}/system" ]; then
+            for part in vendor product odm system_ext; do
+              if [ -d "${OUT_DIR}/${part}" ] && [ ! -e "${OUT_DIR}/system/${part}" ]; then
+                ln -sf "../${part}" "${OUT_DIR}/system/${part}"
+              fi
+            done
+          fi
+
+      - name: Run extraction
+        run: |
+          set -e
+          ROOT="$(pwd)/android"
+          DUMP_INPUT="$(pwd)/prepared_dump/system"
+          DEVICE_DIR="${ROOT}/device/xiaomi/spinel"
+
+          chmod +x "${DEVICE_DIR}/extract-files.sh" "${DEVICE_DIR}/setup-makefiles.sh" 2>/dev/null || true
+          chmod +x "${DEVICE_DIR}/extract-files.py" "${DEVICE_DIR}/setup-makefiles.py" 2>/dev/null || true
+
+          cd "${DEVICE_DIR}"
+          if [ -f extract-files.py ]; then
+            PYTHONPATH="${ROOT}/tools/extract-utils" python3 extract-files.py "${DUMP_INPUT}"
+          elif [ -f extract-files.sh ]; then
+            bash extract-files.sh "${DUMP_INPUT}"
+          else
+            echo "::error::extract-files script not found in device tree"
+            exit 1
+          fi
+
+      - name: Cleanup mounts
+        if: always()
+        run: |
+          for part in system vendor product odm system_ext; do
+            sudo umount "prepared_dump/${part}" 2>/dev/null || true
+          done
+
+      - name: Summary
+        run: |
+          echo "Generated files:"
+          find android/vendor/xiaomi/spinel -type f | head -100 || true
+          echo "Total: $(find android/vendor/xiaomi/spinel -type f | wc -l)"
+
+      - name: Commit and push
+        if: ${{ inputs.PUSH_TO_REPO }}
         run: |
           cd android/vendor/xiaomi/spinel
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add -A
           if git diff --cached --quiet; then
-            echo "Nothing to commit - vendor tree is already up to date."
+            echo "No changes to commit"
           else
-            git commit -m "vendor: spinel: update blobs from firmware"
+            git commit -m "vendor: spinel: update blobs from Stock_room_dumb"
             git push origin HEAD:main
           fi
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
