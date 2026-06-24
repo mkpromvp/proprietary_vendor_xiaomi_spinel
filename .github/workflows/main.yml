@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       LINEAGE_BRANCH:
-        description: "Preferred branch for extract-utils/extract-tools/device-tree"
+        description: "Branch for extract-utils/extract-tools/device-tree"
         required: false
         default: "lineage-23.2"
         type: string
@@ -27,12 +27,12 @@ jobs:
       DEVICE_TREE_REPO: https://github.com/mkpromvp/android_device_xiaomi_spinel.git
 
     steps:
-      - name: Checkout vendor repo
+      - name: Checkout vendor repository
         uses: actions/checkout@v4
         with:
           path: android/vendor/xiaomi/spinel
 
-      - name: Install deps
+      - name: Install dependencies
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends \
@@ -90,8 +90,8 @@ jobs:
           OUT_DIR="${ROOT}/prepared_dump"
           mkdir -p "${OUT_DIR}"
 
-          # copy all likely partitions used by proprietary-files/device tree
-          for p in system vendor product system_ext odm mi_ext bin vendor_dlkm system_dlkm odm_dlkm; do
+          # Copy all relevant unpacked partitions
+          for p in system vendor product system_ext odm mi_ext vendor_dlkm system_dlkm odm_dlkm; do
             if [ -d "${SRC_DIR}/${p}" ]; then
               mkdir -p "${OUT_DIR}/${p}"
               cp -a "${SRC_DIR}/${p}/." "${OUT_DIR}/${p}/"
@@ -110,7 +110,28 @@ jobs:
             exit 1
           fi
 
-      - name: Add prebuilt path shims expected by extract-utils
+      - name: Patch proprietary lists for this dump
+        run: |
+          set -e
+          DEV_DIR="android/device/xiaomi/spinel"
+
+          # Fix known wrong path in list
+          if [ -f "${DEV_DIR}/proprietary-files.txt" ]; then
+            sed -i 's#^bin/iwpriv#vendor/bin/iwpriv#' "${DEV_DIR}/proprietary-files.txt"
+
+            # Remove known empty placeholders from this dump
+            sed -i '/^mi_ext\/system_ext\/app\/MtkCalendar\/MtkCalendar\.apk$/d' "${DEV_DIR}/proprietary-files.txt"
+            sed -i '/^mi_ext\/system_ext\/priv-app\/MtkContacts\/MtkContacts\.apk$/d' "${DEV_DIR}/proprietary-files.txt"
+          fi
+
+          # Remove missing firmware image entries that are not present in this dump
+          if [ -f "${DEV_DIR}/proprietary-firmware.txt" ]; then
+            cp -f "${DEV_DIR}/proprietary-firmware.txt" "${DEV_DIR}/proprietary-firmware.txt.bak"
+            grep -Ev '^(dpm|gz|lk|mcupm|md1img|pi_img|preloader_raw|scp|spmfw|sspm|tee)\.img$' \
+              "${DEV_DIR}/proprietary-firmware.txt.bak" > "${DEV_DIR}/proprietary-firmware.txt"
+          fi
+
+      - name: Add toolchain path shims expected by extract-utils
         run: |
           set -e
           ROOT="$(pwd)/android"
@@ -123,104 +144,12 @@ jobs:
             ln -sf "$(command -v llvm-objdump)" "${ROOT}/prebuilts/clang/host/linux-x86/llvm-binutils-stable/llvm-objdump"
           fi
 
-      - name: Direct proprietary-files extraction (primary mode)
-        run: |
-          set -e
-          ROOT="$(pwd)"
-          SRC_DIR="${ROOT}/stock_dump/${DUMP_SUBDIR}"
-          DUMP_ROOT="${ROOT}/prepared_dump"
-          DUMP_SYSTEM="${ROOT}/prepared_dump/system"
-          TARGET="${ROOT}/android/vendor/xiaomi/spinel"
-          PROP_LIST="$(find "${SRC_DIR}" -maxdepth 6 -type f -name proprietary-files.txt | head -n 1 || true)"
-
-          if [ -n "${PROP_LIST}" ]; then
-            echo "Using direct extraction mode from ${PROP_LIST}"
-            mkdir -p "${TARGET}/proprietary"
-            cp -f "${PROP_LIST}" "${TARGET}/proprietary-files.txt"
-
-            copied=0
-            missing=0
-
-            while IFS= read -r raw || [ -n "${raw}" ]; do
-              line="$(echo "${raw}" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
-              [ -z "${line}" ] && continue
-              echo "${line}" | grep -q '^#' && continue
-
-              entry="${line#-}"
-              entry="${entry%%;*}"
-              entry="${entry%%|*}"
-
-              src="${entry%%:*}"
-              dst="${entry#*:}"
-              [ "${dst}" = "${entry}" ] && dst="${src}"
-              [ -z "${src}" ] && continue
-
-              src_path=""
-              for c in "${DUMP_ROOT}/${src}" "${DUMP_SYSTEM}/${src}"; do
-                if [ -f "${c}" ] || [ -L "${c}" ]; then
-                  src_path="${c}"
-                  break
-                fi
-              done
-
-              if [ -z "${src_path}" ]; then
-                missing=$((missing + 1))
-                continue
-              fi
-
-              out="${TARGET}/proprietary/${dst}"
-              mkdir -p "$(dirname "${out}")"
-              cp -a "${src_path}" "${out}"
-              copied=$((copied + 1))
-            done < "${PROP_LIST}"
-
-            echo "Copied blobs: ${copied}"
-            echo "Missing blobs: ${missing}"
-
-            if [ "${copied}" -lt 100 ]; then
-              echo "::error::Too few blobs copied in direct mode"
-              exit 1
-            fi
-
-            echo "USED_DIRECT_MODE=1" >> "${GITHUB_ENV}"
-          else
-            echo "USED_DIRECT_MODE=0" >> "${GITHUB_ENV}"
-          fi
-
-      - name: Fallback extract-files.py mode
-        if: env.USED_DIRECT_MODE != '1'
+      - name: Run extraction + regenerate makefiles
         run: |
           set -e
           cd android/device/xiaomi/spinel
           PYTHONPATH=../../../tools/extract-utils python3 extract-files.py "$(pwd)/../../../prepared_dump"
           PYTHONPATH=../../../tools/extract-utils python3 extract-files.py --regenerate_makefiles
-
-      - name: Ensure root makefiles exist
-        run: |
-          set -e
-          TARGET="android/vendor/xiaomi/spinel"
-
-          [ -f "${TARGET}/Android.bp" ] || cat > "${TARGET}/Android.bp" <<'EOF'
-          soong_namespace {
-          }
-          EOF
-
-          [ -f "${TARGET}/Android.mk" ] || cat > "${TARGET}/Android.mk" <<'EOF'
-          LOCAL_PATH := $(call my-dir)
-
-          ifneq ($(filter spinel,$(TARGET_DEVICE)),)
-          include $(call all-makefiles-under,$(LOCAL_PATH))
-          endif
-          EOF
-
-          [ -f "${TARGET}/BoardConfigVendor.mk" ] || cat > "${TARGET}/BoardConfigVendor.mk" <<'EOF'
-          BOARD_VENDOR := xiaomi
-          EOF
-
-          [ -f "${TARGET}/spinel-vendor.mk" ] || cat > "${TARGET}/spinel-vendor.mk" <<'EOF'
-          # Auto-generated placeholder
-          PRODUCT_COPY_FILES +=
-          EOF
 
       - name: Validate output
         run: |
