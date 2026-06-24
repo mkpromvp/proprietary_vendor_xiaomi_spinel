@@ -218,7 +218,9 @@ jobs:
             exit 1
           fi
 
-          sed -i 's#^bin/iwpriv#vendor/bin/iwpriv#' "${DEV_DIR}/proprietary-files.txt"
+          # Normalize iwpriv into exactly one canonical entry.
+          sed -i -E '/^[-?]*bin\/iwpriv([:;].*)?$/d; /^[-?]*vendor\/bin\/iwpriv([:;].*)?$/d' "${DEV_DIR}/proprietary-files.txt"
+          printf '\nvendor/bin/iwpriv\n' >> "${DEV_DIR}/proprietary-files.txt"
 
           # Remove known empty placeholders from this dump.
           sed -i '/^mi_ext\/system_ext\/app\/MtkCalendar\/MtkCalendar\.apk$/d' "${DEV_DIR}/proprietary-files.txt"
@@ -252,44 +254,9 @@ jobs:
 
           mv "${tmp_list}" "${DEV_DIR}/proprietary-files.txt"
 
-          # extract-utils fails on duplicate destination entries, so dedupe by dst path.
-          python3 - <<'PY'
-import re
-from pathlib import Path
-
-pf = Path("android/device/xiaomi/spinel/proprietary-files.txt")
-out = []
-seen_dst = set()
-
-for raw in pf.read_text(encoding="utf-8").splitlines():
-    line = raw.rstrip("\n")
-    stripped = line.strip()
-    if not stripped or stripped.startswith("#") or stripped.startswith(":"):
-        out.append(line)
-        continue
-
-    entry = stripped
-    if entry.startswith("-"):
-        entry = entry[1:]
-    if entry.startswith("?"):
-        entry = entry[1:]
-
-    entry = entry.split(";", 1)[0]
-    if ":" in entry:
-        src, dst = entry.split(":", 1)
-        dst_key = dst
-    else:
-        src = entry
-        dst_key = src
-
-    if dst_key in seen_dst:
-        continue
-
-    seen_dst.add(dst_key)
-    out.append(line)
-
-pf.write_text("\n".join(out) + "\n", encoding="utf-8")
-PY
+          # Safety: enforce one iwpriv line after all pruning operations.
+          sed -i -E '/^[-?]*bin\/iwpriv([:;].*)?$/d; /^[-?]*vendor\/bin\/iwpriv([:;].*)?$/d' "${DEV_DIR}/proprietary-files.txt"
+          printf '\nvendor/bin/iwpriv\n' >> "${DEV_DIR}/proprietary-files.txt"
 
           if [ -f "${DEV_DIR}/proprietary-firmware.txt" ]; then
             cp -f "${DEV_DIR}/proprietary-firmware.txt" "${DEV_DIR}/proprietary-firmware.txt.bak"
