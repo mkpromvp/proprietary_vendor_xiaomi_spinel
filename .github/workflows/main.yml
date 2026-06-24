@@ -1,0 +1,100 @@
+name: Generate Spinel Vendor Tree
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build-vendor:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout device repo
+        uses: actions/checkout@v4
+
+      - name: Prepare workspace
+        run: |
+          set -e
+          mkdir -p ~/android/lineage/device/xiaomi
+          mkdir -p ~/android/lineage/tools
+          mkdir -p ~/stock_dumps
+
+      - name: Clone device tree into LOS layout
+        run: |
+          set -e
+          git clone --depth=1 --branch lineage-23.2 https://github.com/${{ github.repository_owner }}/android_device_xiaomi_spinel.git ~/android/lineage/device/xiaomi/spinel
+
+      - name: Clone extract-utils
+        run: |
+          set -e
+          git clone --depth=1 https://github.com/LineageOS/android_tools_extract-utils ~/android/lineage/tools/extract-utils
+
+      - name: Build sparse paths list
+        run: |
+          set -e
+          cd ~/android/lineage/device/xiaomi/spinel
+          awk '
+          /^[[:space:]]*#/ {next}
+          /^[[:space:]]*$/ {next}
+          {
+            line=$0
+            sub(/^-/, "", line)
+            sub(/\|.*/, "", line)
+            sub(/:.*/, "", line)
+            gsub(/[[:space:]]+$/, "", line)
+            if (line!="") print line
+          }' proprietary-files.txt > ~/stock_dumps/spinel_paths.txt
+
+          if [ -f proprietary-firmware.txt ]; then
+            awk '
+            /^[[:space:]]*#/ {next}
+            /^[[:space:]]*$/ {next}
+            {
+              line=$0
+              sub(/\|.*/, "", line)
+              sub(/:.*/, "", line)
+              sub(/;.*/, "", line)
+              gsub(/[[:space:]]+$/, "", line)
+              if (line!="") print line
+            }' proprietary-firmware.txt >> ~/stock_dumps/spinel_paths.txt
+          fi
+
+          cat >> ~/stock_dumps/spinel_paths.txt <<'EOF'
+          vendor/build.prop
+          system/system/build.prop
+          vendor_boot/recovery_ramdisk/first_stage_ramdisk/fstab.emmc
+          EOF
+
+          sort -u ~/stock_dumps/spinel_paths.txt -o ~/stock_dumps/spinel_paths.txt
+
+      - name: Clone dump sparse
+        run: |
+          set -e
+          git clone --filter=blob:none --no-checkout --depth=1 --branch dump-redmi-spinel-os3.0.301.0.wpgmixm https://gitlab.com/mkpromvp/Stock_room_dumb.git ~/stock_dumps/spinel_sparse
+          cd ~/stock_dumps/spinel_sparse
+          git sparse-checkout init --no-cone
+          cp ~/stock_dumps/spinel_paths.txt .git/info/sparse-checkout
+          git checkout
+
+      - name: Extract vendor blobs
+        run: |
+          set -e
+          cd ~/android/lineage/device/xiaomi/spinel
+          chmod +x extract-files.py setup-makefiles.py
+          ./extract-files.py ~/stock_dumps/spinel_sparse
+          ./setup-makefiles.py
+
+      - name: Push vendor repo
+        env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+        run: |
+          set -e
+          cd ~/android/lineage/vendor/xiaomi/spinel
+          rm -rf .git
+          git init
+          git checkout -b lineage-23.2
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add .
+          git commit -m "spinel: auto-generate vendor tree from stock dump" || true
+          git remote add origin "https://${{ github.repository_owner }}:${BOT_TOKEN}@github.com/${{ github.repository_owner }}/proprietary_vendor_xiaomi_spinel.git"
+          git push -u origin lineage-23.2 --force
