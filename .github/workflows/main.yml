@@ -8,30 +8,33 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout device repo
+      - name: Checkout current repo
         uses: actions/checkout@v4
 
-      - name: Prepare workspace
+      - name: Prepare dirs
         run: |
           set -e
           mkdir -p ~/android/lineage/device/xiaomi
           mkdir -p ~/android/lineage/tools
+          mkdir -p ~/android/lineage/prebuilts
           mkdir -p ~/stock_dumps
 
-      - name: Clone device tree into LOS layout
+      - name: Clone device tree
         run: |
           set -e
           git clone --depth=1 --branch lineage-23.2 https://github.com/${{ github.repository_owner }}/android_device_xiaomi_spinel.git ~/android/lineage/device/xiaomi/spinel
 
-      - name: Clone extract-utils
+      - name: Clone extract-utils + extract-tools prebuilts
         run: |
           set -e
           git clone --depth=1 https://github.com/LineageOS/android_tools_extract-utils ~/android/lineage/tools/extract-utils
+          git clone --depth=1 https://github.com/LineageOS/android_prebuilts_extract-tools ~/android/lineage/prebuilts/extract-tools
 
       - name: Build sparse paths list
         run: |
           set -e
           cd ~/android/lineage/device/xiaomi/spinel
+
           awk '
           /^[[:space:]]*#/ {next}
           /^[[:space:]]*$/ {next}
@@ -59,6 +62,7 @@ jobs:
           fi
 
           cat >> ~/stock_dumps/spinel_paths.txt <<'EOF'
+          all_files.txt
           vendor/build.prop
           system/system/build.prop
           vendor_boot/recovery_ramdisk/first_stage_ramdisk/fstab.emmc
@@ -75,7 +79,73 @@ jobs:
           cp ~/stock_dumps/spinel_paths.txt .git/info/sparse-checkout
           git checkout
 
-      - name: Extract vendor blobs
+      - name: Resolve missing paths by basename fallback
+        run: |
+          set -e
+          python3 - <<'PY'
+          import os, re, shutil
+
+          dump = os.path.expanduser("~/stock_dumps/spinel_sparse")
+          allf = os.path.join(dump, "all_files.txt")
+          pathsf = os.path.expanduser("~/stock_dumps/spinel_paths.txt")
+
+          if not os.path.exists(allf):
+              raise SystemExit("all_files.txt not found in sparse dump")
+
+          with open(allf, "r", encoding="utf-8", errors="ignore") as f:
+              all_paths = [x.strip() for x in f if x.strip()]
+
+          by_base = {}
+          for p in all_paths:
+              by_base.setdefault(os.path.basename(p), []).append(p)
+
+          def ensure_path(rel):
+              target = os.path.join(dump, rel)
+              if os.path.exists(target):
+                  return True
+              bn = os.path.basename(rel)
+              cands = by_base.get(bn, [])
+              if not cands:
+                  return False
+              src_rel = cands[0]
+              src = os.path.join(dump, src_rel)
+              if not os.path.exists(src):
+                  return False
+              os.makedirs(os.path.dirname(target), exist_ok=True)
+              shutil.copy2(src, target)
+              print(f"[FALLBACK] {rel} <= {src_rel}")
+              return True
+
+          with open(pathsf, "r", encoding="utf-8", errors="ignore") as f:
+              reqs = [x.strip() for x in f if x.strip()]
+
+          miss = []
+          for r in reqs:
+              if not ensure_path(r):
+                  miss.append(r)
+
+          with open(os.path.expanduser("~/stock_dumps/still_missing.txt"), "w", encoding="utf-8") as f:
+              for m in miss:
+                  f.write(m + "\n")
+
+          print("missing:", len(miss))
+          PY
+
+      - name: Trim missing firmware entries (non-fatal)
+        run: |
+          set -e
+          cd ~/android/lineage/device/xiaomi/spinel
+          cp -f proprietary-firmware.txt proprietary-firmware.txt.bak || true
+          if [ -f ~/stock_dumps/still_missing.txt ] && [ -f proprietary-firmware.txt ]; then
+            while IFS= read -r m; do
+              [ -z "$m" ] && continue
+              # only trim firmware-style entries
+              echo "$m" | grep -Eq '\.img$|preloader' || continue
+              sed -i "\#^$m#d" proprietary-firmware.txt || true
+            done < ~/stock_dumps/still_missing.txt
+          fi
+
+      - name: Extract blobs
         run: |
           set -e
           cd ~/android/lineage/device/xiaomi/spinel
@@ -95,6 +165,18 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add .
-          git commit -m "spinel: auto-generate vendor tree from stock dump" || true
+          git commit -m "spinel: auto-generate vendor tree from stock dump"
+
           git remote add origin "https://${{ github.repository_owner }}:${BOT_TOKEN}@github.com/${{ github.repository_owner }}/proprietary_vendor_xiaomi_spinel.git"
           git push -u origin lineage-23.2 --force
+
+      - name: Set default branch
+        env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+        run: |
+          set -e
+          curl -sS -X PATCH \
+            -H "Authorization: Bearer ${BOT_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${{ github.repository_owner }}/proprietary_vendor_xiaomi_spinel" \
+            -d '{"default_branch":"lineage-23.2"}'
