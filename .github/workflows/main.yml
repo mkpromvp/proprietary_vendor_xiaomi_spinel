@@ -277,6 +277,21 @@ jobs:
             ln -sf "$(command -v llvm-objdump)" "${ROOT}/prebuilts/clang/host/linux-x86/llvm-binutils-stable/llvm-objdump"
           fi
 
+      - name: Configure git identity for blob patching
+        run: |
+          set -euo pipefail
+          # Persist identity in environment so temporary git repos created by
+          # extract-utils can commit patch state.
+          echo "GIT_AUTHOR_NAME=github-actions-bot" >> "$GITHUB_ENV"
+          echo "GIT_AUTHOR_EMAIL=github-actions[bot]@users.noreply.github.com" >> "$GITHUB_ENV"
+          echo "GIT_COMMITTER_NAME=github-actions-bot" >> "$GITHUB_ENV"
+          echo "GIT_COMMITTER_EMAIL=github-actions[bot]@users.noreply.github.com" >> "$GITHUB_ENV"
+
+          git config --global user.name "github-actions-bot"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git config --global --get user.name
+          git config --global --get user.email
+
       - name: Run extraction and regenerate makefiles
         run: |
           set -euo pipefail
