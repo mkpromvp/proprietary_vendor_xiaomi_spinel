@@ -107,12 +107,31 @@ jobs:
       - name: Clone dump with sparse checkout
         run: |
           set -euo pipefail
-          git clone --depth=1 --filter=blob:none --no-checkout -b "${{ inputs.DUMP_BRANCH }}" "${DUMP_REPO}" stock_dump
+          git config --global http.version HTTP/1.1
+
+          retry() {
+            local n=1
+            local max=5
+            local delay=10
+            while true; do
+              "$@" && break
+              if [ "$n" -ge "$max" ]; then
+                echo "::error::Command failed after ${max} attempts: $*"
+                return 1
+              fi
+              echo "Attempt ${n} failed, retrying in ${delay}s..."
+              n=$((n + 1))
+              sleep "$delay"
+            done
+          }
+
+          rm -rf stock_dump
+          retry git clone --depth=1 --sparse -b "${{ inputs.DUMP_BRANCH }}" "${DUMP_REPO}" stock_dump
+
           cd stock_dump
-          git sparse-checkout init --no-cone
-          git sparse-checkout set \
+          git sparse-checkout set --no-cone \
             /system/** /vendor/** /product/** /system_ext/** /odm/** /mi_ext/** /vendor_dlkm/** /system_dlkm/** /odm_dlkm/**
-          git checkout
+          retry git checkout
 
       - name: Prepare dump directory
         run: |
