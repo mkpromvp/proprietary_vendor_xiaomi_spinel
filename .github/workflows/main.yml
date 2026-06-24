@@ -4,12 +4,12 @@ on:
   workflow_dispatch:
     inputs:
       LINEAGE_BRANCH:
-        description: "Preferred branch for extract-utils/extract-tools"
+        description: "Lineage branch for extract utils/tools and device tree"
         required: false
         default: "lineage-23.2"
         type: string
       PUSH_TO_REPO:
-        description: "Push generated tree to current branch"
+        description: "Push generated blobs to current branch"
         required: false
         default: true
         type: boolean
@@ -23,16 +23,15 @@ jobs:
     env:
       DUMP_REPO: https://gitlab.com/mkpromvp/Stock_room_dumb.git
       DUMP_BRANCH: dump-redmi-spinel-os3.0.301.0.wpgmixm
-      DUMP_SUBDIR: .
-      FALLBACK_DEVICE_TREE_URL: https://github.com/mkpromvp/android_device_xiaomi_spinel
+      DEVICE_TREE_REPO: https://github.com/mkpromvp/android_device_xiaomi_spinel.git
 
     steps:
-      - name: Checkout vendor repository
+      - name: Checkout vendor repo
         uses: actions/checkout@v4
         with:
           path: android/vendor/xiaomi/spinel
 
-      - name: Install dependencies
+      - name: Install deps
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends \
@@ -40,27 +39,23 @@ jobs:
             openjdk-21-jdk-headless patchelf erofs-utils p7zip-full \
             android-sdk-libsparse-utils
 
-      - name: Clone Lineage extraction tools with fallback
+      - name: Clone extract utils/tools
         run: |
           set -e
-
           clone_with_fallback() {
             local repo_url="$1"
             local dst="$2"
             local preferred="$3"
             shift 3
             local branches=("${preferred}" "$@")
-
             for b in "${branches[@]}"; do
               if git ls-remote --exit-code --heads "${repo_url}" "${b}" >/dev/null 2>&1; then
-                echo "Using ${repo_url} @ ${b}"
                 git clone --depth=1 -b "${b}" "${repo_url}" "${dst}"
                 return 0
               fi
             done
-
-            echo "::error::Could not find a valid branch for ${repo_url}"
-            return 1
+            echo "::error::No valid branch found for ${repo_url}"
+            exit 1
           }
 
           clone_with_fallback \
@@ -75,331 +70,52 @@ jobs:
             "${{ inputs.LINEAGE_BRANCH }}" \
             "lineage-23.2" "lineage-23.0" "lineage-22.2"
 
-      - name: Clone stock dump repository
+      - name: Clone device tree and dump
         run: |
+          git clone --depth=1 -b "${{ inputs.LINEAGE_BRANCH }}" "${DEVICE_TREE_REPO}" android/device/xiaomi/spinel || \
+          git clone --depth=1 -b lineage-23.2 "${DEVICE_TREE_REPO}" android/device/xiaomi/spinel
+
           git clone --depth=1 -b "${DUMP_BRANCH}" "${DUMP_REPO}" stock_dump
 
-      - name: Analyze dump and detect extraction source
+      - name: Prepare unpacked dump
         run: |
           set -e
-          ROOT="$(pwd)"
-          SRC_DIR="${ROOT}/stock_dump/${DUMP_SUBDIR}"
-          META_TMP="${ROOT}/dump-metadata.txt"
-
-          if [ ! -d "${SRC_DIR}" ]; then
-            echo "::error::Dump path does not exist: ${SRC_DIR}"
-            exit 1
-          fi
-
-          echo "Dump root listing:"
-          find "${SRC_DIR}" -maxdepth 3 -type d | head -200 || true
-
-          # First priority: use proprietary-files list from dump for direct vendor generation.
-          PROP_LIST=$(find "${SRC_DIR}" -maxdepth 6 -type f -name "proprietary-files.txt" | head -n 1 || true)
-
-          if [ -n "${PROP_LIST}" ]; then
-            echo "Found proprietary list in dump: ${PROP_LIST}"
-            echo "USE_PROP_LIST=1" >>"${GITHUB_ENV}"
-            echo "PROP_LIST_PATH=${PROP_LIST}" >>"${GITHUB_ENV}"
-          else
-            echo "USE_PROP_LIST=0" >>"${GITHUB_ENV}"
-          fi
-
-          # Second priority: use extract-files script that already exists in dump.
-          DUMP_SCRIPT=$(find "${SRC_DIR}" -maxdepth 8 -type f \( -name "extract-files.py" -o -name "extract-files.sh" \) | head -n 1 || true)
-
-          DEVICE="spinel"
-          VENDOR="xiaomi"
-          DEVICE_TREE_URL=""
-          DEVICE_TREE_BRANCH="lineage-23.2"
-          SOURCE_DEVICE_DIR=""
-
-          if [ -n "${DUMP_SCRIPT}" ]; then
-            SOURCE_DEVICE_DIR=$(dirname "${DUMP_SCRIPT}")
-            echo "Found extract script in dump: ${DUMP_SCRIPT}"
-
-            # Try to derive vendor/device from path like .../device/<vendor>/<device>/...
-            PATH_MATCH=$(echo "${SOURCE_DEVICE_DIR}" | sed -n 's#.*device/\([^/]*\)/\([^/]*\).*#\1 \2#p')
-            if [ -n "${PATH_MATCH}" ]; then
-              VENDOR=$(echo "${PATH_MATCH}" | awk '{print $1}')
-              DEVICE=$(echo "${PATH_MATCH}" | awk '{print $2}')
+          mkdir -p prepared_dump
+          for p in system vendor product system_ext odm; do
+            if [ -d "stock_dump/${p}" ]; then
+              mkdir -p "prepared_dump/${p}"
+              cp -a "stock_dump/${p}/." "prepared_dump/${p}/"
             fi
-
-            echo "USE_DUMP_DEVICE_TREE=1" >>"${GITHUB_ENV}"
-            echo "SOURCE_DEVICE_DIR=${SOURCE_DEVICE_DIR}" >>"${GITHUB_ENV}"
-          else
-            echo "USE_DUMP_DEVICE_TREE=0" >>"${GITHUB_ENV}"
-          fi
-
-          # Aggregate metadata files for optional URL and branch hints.
-          : >"${META_TMP}"
-          find "${SRC_DIR}" -maxdepth 4 -type f \
-            \( -iname "*readme*" -o -iname "*info*" -o -iname "*meta*" -o -name "*.txt" -o -name "*.md" -o -name "*.json" -o -name "build.prop" \) \
-            -print0 | while IFS= read -r -d '' f; do
-              head -n 300 "${f}" >>"${META_TMP}" || true
-              echo >>"${META_TMP}"
-            done
-
-          if [ -s "${META_TMP}" ]; then
-            CANDIDATE_URL=$(grep -Eo 'https://github\.com/[^[:space:]]+/android_device_[^[:space:]]+' "${META_TMP}" | head -n 1 || true)
-            CANDIDATE_URL=$(echo "${CANDIDATE_URL}" | sed 's/[),.;]$//; s#\.git$##')
-            [ -n "${CANDIDATE_URL}" ] && DEVICE_TREE_URL="${CANDIDATE_URL}"
-
-            CANDIDATE_BRANCH=$(grep -Eo 'lineage-[0-9]+\.[0-9]+' "${META_TMP}" | head -n 1 || true)
-            [ -n "${CANDIDATE_BRANCH}" ] && DEVICE_TREE_BRANCH="${CANDIDATE_BRANCH}"
-          fi
-
-          # If no dump script path matched vendor/device, derive from build.prop.
-          if [ "${VENDOR}" = "xiaomi" ] && [ "${DEVICE}" = "spinel" ]; then
-            PROP_FILE=$(find "${SRC_DIR}" -maxdepth 5 -type f -name build.prop | head -n 1 || true)
-            if [ -n "${PROP_FILE}" ]; then
-              DETECT_DEVICE=$(grep -m1 -E '^(ro\.product\.vendor\.device|ro\.product\.device)=' "${PROP_FILE}" | cut -d= -f2 || true)
-              DETECT_VENDOR=$(grep -m1 -E '^(ro\.product\.vendor\.brand|ro\.product\.brand)=' "${PROP_FILE}" | cut -d= -f2 || true)
-              [ -n "${DETECT_DEVICE}" ] && DEVICE="${DETECT_DEVICE}"
-              [ -n "${DETECT_VENDOR}" ] && VENDOR="${DETECT_VENDOR}"
-            fi
-          fi
-
-          if [ -z "${DEVICE_TREE_URL}" ]; then
-            DEVICE_TREE_URL="${FALLBACK_DEVICE_TREE_URL}"
-          fi
-
-          echo "VENDOR=${VENDOR}" >>"${GITHUB_ENV}"
-          echo "DEVICE=${DEVICE}" >>"${GITHUB_ENV}"
-          echo "DEVICE_TREE_URL=${DEVICE_TREE_URL}" >>"${GITHUB_ENV}"
-          echo "DEVICE_TREE_BRANCH=${DEVICE_TREE_BRANCH}" >>"${GITHUB_ENV}"
-
-      - name: Materialize device tree from dump or git
-        run: |
-          set -e
-
-          if [ "${USE_PROP_LIST}" = "1" ]; then
-            echo "Using proprietary-files list mode; device tree materialization not required."
-            exit 0
-          fi
-
-          TARGET_DIR="android/device/${VENDOR}/${DEVICE}"
-          mkdir -p "$(dirname "${TARGET_DIR}")"
-
-          if [ "${USE_DUMP_DEVICE_TREE}" = "1" ]; then
-            echo "Using device tree from dump: ${SOURCE_DEVICE_DIR}"
-            rm -rf "${TARGET_DIR}"
-            cp -a "${SOURCE_DEVICE_DIR}" "${TARGET_DIR}"
-          else
-            echo "No device tree script inside dump. Cloning: ${DEVICE_TREE_URL}"
-            clone_branch="${DEVICE_TREE_BRANCH}"
-            if ! git ls-remote --exit-code --heads "${DEVICE_TREE_URL}" "${clone_branch}" >/dev/null 2>&1; then
-              if git ls-remote --exit-code --heads "${DEVICE_TREE_URL}" "lineage-23.2" >/dev/null 2>&1; then
-                clone_branch="lineage-23.2"
-              elif git ls-remote --exit-code --heads "${DEVICE_TREE_URL}" "lineage-23.0" >/dev/null 2>&1; then
-                clone_branch="lineage-23.0"
-              elif git ls-remote --exit-code --heads "${DEVICE_TREE_URL}" "lineage-22.2" >/dev/null 2>&1; then
-                clone_branch="lineage-22.2"
-              else
-                clone_branch="main"
-              fi
-            fi
-            git clone --depth=1 -b "${clone_branch}" "${DEVICE_TREE_URL}" "${TARGET_DIR}"
-          fi
-
-          echo "Resolved device tree content:"
-          ls -la "${TARGET_DIR}" || true
-
-          SCRIPT_PATH=$(find "${TARGET_DIR}" -maxdepth 4 -type f \( -name "extract-files.py" -o -name "extract-files.sh" \) | head -n 1 || true)
-          if [ -z "${SCRIPT_PATH}" ]; then
-            echo "::error::No extract-files script found under ${TARGET_DIR}"
-            find "${TARGET_DIR}" -maxdepth 4 -type f | head -120 || true
-            exit 1
-          fi
-          echo "DEVICE_SCRIPT_DIR=$(dirname "${SCRIPT_PATH}")" >>"${GITHUB_ENV}"
-
-      - name: Prepare dump source
-        run: |
-          set -e
-          ROOT="$(pwd)"
-          SRC_DIR="${ROOT}/stock_dump/${DUMP_SUBDIR}"
-          OUT_DIR="${ROOT}/prepared_dump"
-          mkdir -p "${OUT_DIR}" "${OUT_DIR}/system"
-
-          # Dump is expected to be unpacked stock files; detect the actual partition root.
-          PARTS_BASE="${SRC_DIR}"
-          if [ ! -d "${PARTS_BASE}/system" ]; then
-            SYSTEM_DIR=$(find "${SRC_DIR}" -maxdepth 8 -type d -name system | head -n 1 || true)
-            if [ -n "${SYSTEM_DIR}" ]; then
-              PARTS_BASE="$(dirname "${SYSTEM_DIR}")"
-            fi
-          fi
-
-          echo "Using partition base: ${PARTS_BASE}"
-
-          for part in system vendor product odm system_ext; do
-            if [ -d "${PARTS_BASE}/${part}" ]; then
-              mkdir -p "${OUT_DIR}/${part}"
-              cp -a "${PARTS_BASE}/${part}/." "${OUT_DIR}/${part}/"
+          done
+          mkdir -p prepared_dump/system
+          for p in vendor product system_ext odm; do
+            if [ -d "prepared_dump/${p}" ] && [ ! -e "prepared_dump/system/${p}" ]; then
+              ln -sf "../${p}" "prepared_dump/system/${p}"
             fi
           done
 
-          # Fallback only when unpacked directories are missing.
-          if [ ! -d "${OUT_DIR}/system" ] || [ -z "$(find "${OUT_DIR}/system" -mindepth 1 -print -quit)" ]; then
-            PREBUILT_SIMG2IMG="${ROOT}/android/prebuilts/extract-tools/linux-x86/bin/simg2img"
-            if [ -x "${PREBUILT_SIMG2IMG}" ]; then
-              SIMG2IMG="${PREBUILT_SIMG2IMG}"
-            elif command -v simg2img >/dev/null 2>&1; then
-              SIMG2IMG="$(command -v simg2img)"
-            else
-              SIMG2IMG=""
-            fi
-
-            for part in system vendor product odm system_ext; do
-              IMG=$(find "${SRC_DIR}" -maxdepth 8 -type f -name "${part}.img" | head -n 1 || true)
-              [ -n "${IMG}" ] || continue
-
-              DEST="${OUT_DIR}/${part}"
-              mkdir -p "${DEST}"
-
-              if file "${IMG}" | grep -q "EROFS"; then
-                fsck.erofs --extract="${DEST}" "${IMG}" || true
-                continue
-              fi
-
-              RAW_IMG="${IMG}.raw"
-              if file "${IMG}" | grep -q "Android sparse"; then
-                if [ -n "${SIMG2IMG}" ]; then
-                  "${SIMG2IMG}" "${IMG}" "${RAW_IMG}" || cp "${IMG}" "${RAW_IMG}"
-                else
-                  cp "${IMG}" "${RAW_IMG}"
-                fi
-              else
-                cp "${IMG}" "${RAW_IMG}"
-              fi
-
-              sudo mount -o ro,loop "${RAW_IMG}" "${DEST}" || (7z x -o"${DEST}" "${RAW_IMG}" -y >/dev/null 2>&1 || true)
-            done
-          fi
-
-          if [ ! -d "${OUT_DIR}/system" ] || [ -z "$(find "${OUT_DIR}/system" -mindepth 1 -print -quit)" ]; then
-            echo "::error::System content not found in dump"
+          if [ ! -d prepared_dump/system ] || [ -z "$(find prepared_dump/system -mindepth 1 -print -quit)" ]; then
+            echo "::error::No unpacked system content found in dump"
             exit 1
           fi
 
-          for part in vendor product odm system_ext; do
-            if [ -d "${OUT_DIR}/${part}" ] && [ ! -e "${OUT_DIR}/system/${part}" ]; then
-              ln -sf "../${part}" "${OUT_DIR}/system/${part}"
-            fi
-          done
-
-      - name: Run extraction
+      - name: Extract blobs + regenerate makefiles
         run: |
           set -e
-          ROOT="$(pwd)"
-          ANDROID_ROOT="${ROOT}/android"
-          DUMP_ROOT="${ROOT}/prepared_dump"
-          DUMP_SYSTEM="${ROOT}/prepared_dump/system"
+          cd android/device/xiaomi/spinel
+          PYTHONPATH=../../../tools/extract-utils python3 extract-files.py "${GITHUB_WORKSPACE}/prepared_dump"
+          PYTHONPATH=../../../tools/extract-utils python3 extract-files.py --regenerate_makefiles
 
-          if [ "${USE_PROP_LIST}" = "1" ]; then
-            echo "Running direct proprietary-files extraction mode"
-
-            TARGET_BASE="${ANDROID_ROOT}/vendor/xiaomi/spinel/proprietary"
-            mkdir -p "${TARGET_BASE}"
-            cp -f "${PROP_LIST_PATH}" "${ANDROID_ROOT}/vendor/xiaomi/spinel/proprietary-files.txt"
-
-            copied=0
-            missing=0
-
-            while IFS= read -r raw || [ -n "${raw}" ]; do
-              line=$(echo "${raw}" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
-              [ -z "${line}" ] && continue
-              echo "${line}" | grep -q '^#' && continue
-
-              entry="${line#-}"
-              entry="${entry%%;*}"
-              entry="${entry%%|*}"
-
-              src="${entry%%:*}"
-              dst="${entry#*:}"
-              if [ "${dst}" = "${entry}" ]; then
-                dst="${src}"
-              fi
-
-              [ -z "${src}" ] && continue
-
-              src_path=""
-              for c in "${DUMP_ROOT}/${src}" "${DUMP_SYSTEM}/${src}"; do
-                if [ -f "${c}" ] || [ -L "${c}" ]; then
-                  src_path="${c}"
-                  break
-                fi
-              done
-
-              if [ -z "${src_path}" ]; then
-                missing=$((missing + 1))
-                continue
-              fi
-
-              out="${TARGET_BASE}/${dst}"
-              mkdir -p "$(dirname "${out}")"
-              cp -a "${src_path}" "${out}"
-              copied=$((copied + 1))
-            done <"${PROP_LIST_PATH}"
-
-            echo "Copied blobs: ${copied}"
-            echo "Missing blobs: ${missing}"
-
-            if [ "${copied}" -lt 20 ]; then
-              echo "::error::Too few blobs copied from proprietary list"
-              exit 1
-            fi
-          else
-            DEVICE_DIR="${DEVICE_SCRIPT_DIR}"
-            chmod +x "${DEVICE_DIR}/extract-files.sh" "${DEVICE_DIR}/setup-makefiles.sh" 2>/dev/null || true
-            chmod +x "${DEVICE_DIR}/extract-files.py" "${DEVICE_DIR}/setup-makefiles.py" 2>/dev/null || true
-
-            echo "Using extraction directory: ${DEVICE_DIR}"
-            ls -la "${DEVICE_DIR}" || true
-
-            cd "${DEVICE_DIR}"
-            if [ -f extract-files.py ]; then
-              PYTHONPATH="${ANDROID_ROOT}/tools/extract-utils" python3 extract-files.py "${DUMP_ROOT}" || \
-                PYTHONPATH="${ANDROID_ROOT}/tools/extract-utils" python3 extract-files.py "${DUMP_SYSTEM}"
-            elif [ -f extract-files.sh ]; then
-              bash extract-files.sh "${DUMP_SYSTEM}" || bash extract-files.sh "${DUMP_ROOT}"
-            else
-              echo "::error::extract-files script not found"
-              find "${ROOT}/stock_dump" -maxdepth 8 -type f -name "extract-files.*" || true
-              exit 1
-            fi
-          fi
-
-      - name: Cleanup mounts
-        if: always()
-        run: |
-          for part in system vendor product odm system_ext; do
-            sudo umount "prepared_dump/${part}" 2>/dev/null || true
-          done
-
-      - name: Validate output and summary
+      - name: Validate output
         run: |
           set -e
-          TARGET_DIR="android/vendor/xiaomi/spinel"
-          BLOBS_DIR="${TARGET_DIR}/proprietary"
-          if [ ! -d "${TARGET_DIR}" ]; then
-            echo "::error::Vendor output directory missing: ${TARGET_DIR}"
-            exit 1
-          fi
-
-          if [ ! -d "${BLOBS_DIR}" ]; then
-            echo "::error::Blobs directory missing: ${BLOBS_DIR}"
-            exit 1
-          fi
-
-          FILE_COUNT=$(find "${BLOBS_DIR}" -type f | wc -l)
-          echo "Generated files: ${FILE_COUNT}"
-          find "${BLOBS_DIR}" -type f | head -120 || true
-
-          if [ "${FILE_COUNT}" -lt 20 ]; then
-            echo "::error::Vendor tree looks incomplete"
-            exit 1
-          fi
+          cd android/vendor/xiaomi/spinel
+          test -f proprietary-files.txt
+          test -f spinel-vendor.mk
+          test -d proprietary
+          COUNT=$(find proprietary -type f | wc -l)
+          echo "Blob files: ${COUNT}"
+          [ "${COUNT}" -gt 100 ] || (echo "::error::Too few blobs" && exit 1)
 
       - name: Commit and push
         if: ${{ inputs.PUSH_TO_REPO }}
@@ -409,8 +125,8 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add -A
           if git diff --cached --quiet; then
-            echo "No changes to commit"
+            echo "No changes"
           else
-            git commit -m "vendor: spinel: auto update from Stock_room_dumb"
+            git commit -m "vendor: spinel: regenerate from Stock_room_dumb"
             git push origin "HEAD:${GITHUB_REF_NAME}"
           fi
