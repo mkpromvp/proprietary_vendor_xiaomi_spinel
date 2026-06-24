@@ -190,19 +190,7 @@ jobs:
           fi
 
           # Disable stale ImsService apktool patch for this dump revision.
-          python3 - <<'PY'
-from pathlib import Path
-import re
-p = Path("android/device/xiaomi/spinel/extract-files.py")
-s = p.read_text(encoding="utf-8")
-s = re.sub(
-    r"'system_ext/priv-app/ImsService/ImsService\\.apk':\s*blob_fixup\(\)\s*\.apktool_patch\('blob-patches/ImsService\\.patch'\),",
-    "'system_ext/priv-app/ImsService/ImsService.apk': blob_fixup(),",
-    s,
-    flags=re.S,
-)
-p.write_text(s, encoding="utf-8")
-PY
+          python3 -c "from pathlib import Path; import re; p=Path('android/device/xiaomi/spinel/extract-files.py'); s=p.read_text(encoding='utf-8'); s=re.sub(r\"'system_ext/priv-app/ImsService/ImsService\\\\.apk':\\s*blob_fixup\\(\\)\\s*\\.apktool_patch\\('blob-patches/ImsService\\\\.patch'\\),\", \"'system_ext/priv-app/ImsService/ImsService.apk': blob_fixup(),\", s, flags=re.S); p.write_text(s, encoding='utf-8')"
 
       - name: Add extract-utils shims
         run: |
@@ -249,20 +237,11 @@ PY
           fi
 
           if [ ! -f "${TARGET}/Android.bp" ]; then
-            cat > "${TARGET}/Android.bp" <<'EOF'
-soong_namespace {
-}
-EOF
+            printf 'soong_namespace {\n}\n' > "${TARGET}/Android.bp"
           fi
 
           if [ ! -f "${TARGET}/Android.mk" ]; then
-            cat > "${TARGET}/Android.mk" <<'EOF'
-LOCAL_PATH := $(call my-dir)
-
-ifneq ($(filter spinel,$(TARGET_DEVICE)),)
-include $(call all-makefiles-under,$(LOCAL_PATH))
-endif
-EOF
+            printf 'LOCAL_PATH := $(call my-dir)\n\nifneq ($(filter spinel,$(TARGET_DEVICE)),)\ninclude $(call all-makefiles-under,$(LOCAL_PATH))\nendif\n' > "${TARGET}/Android.mk"
           fi
 
           if [ ! -f "${TARGET}/BoardConfigVendor.mk" ]; then
