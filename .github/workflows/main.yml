@@ -209,12 +209,16 @@ jobs:
             cp -f "${DEV_DIR}/proprietary-firmware.txt" "${DEV_DIR}/proprietary-firmware.txt.bak"
             grep -Ev '^(dpm|gz|lk|mcupm|md1img|pi_img|preloader_raw|scp|spmfw|sspm|tee)\.img$' \
               "${DEV_DIR}/proprietary-firmware.txt.bak" > "${DEV_DIR}/proprietary-firmware.txt"
+            # Avoid makefile hashing on missing radio images in this dump.
+            : > "${DEV_DIR}/proprietary-firmware.txt"
           fi
 
           # Force-disable stale ImsService apktool patch with a direct text rewrite.
           # This dump uses a different smali layout, so patch hunks do not match.
           if [ -f "${DEV_DIR}/extract-files.py" ]; then
-            sed -i "s#\.apktool_patch('blob-patches/ImsService\.patch'),#,#g" "${DEV_DIR}/extract-files.py"
+            sed -i "/system_ext\/priv-app\/ImsService\/ImsService.apk/s/blob_fixup()$/blob_fixup(),/" "${DEV_DIR}/extract-files.py"
+            sed -i "/ImsService\.patch/d" "${DEV_DIR}/extract-files.py"
+            sed -i "s/add_firmware_proprietary_file=True/add_firmware_proprietary_file=False/g" "${DEV_DIR}/extract-files.py"
             if grep -q "ImsService.patch" "${DEV_DIR}/extract-files.py"; then
               echo "::error::Failed to neutralize ImsService.patch hook in extract-files.py"
               grep -n "ImsService.patch" "${DEV_DIR}/extract-files.py" || true
