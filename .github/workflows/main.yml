@@ -178,6 +178,10 @@ jobs:
           # Temporary workaround: this dump has a different ImsService smali layout,
           # so the device blob-patch does not apply cleanly.
           sed -i -E '/^[-?]*system_ext\/priv-app\/ImsService\/ImsService\.apk([:;].*)?$/d' "${DEV_DIR}/proprietary-files.txt"
+          # This extract-utils branch makefile generator only handles
+          # system/vendor/product/system_ext/odm/recovery partitions.
+          # Drop unsupported partitions to avoid write_product_packages assertion.
+          sed -i -E '/^[-?]*(mi_ext|vendor_dlkm|system_dlkm|odm_dlkm)\//d' "${DEV_DIR}/proprietary-files.txt"
           # Drop mi_ext paths for this generation pass; they frequently break
           # makefile package grouping with this extract-utils branch.
           sed -i -E '/^[-?]*mi_ext\//d' "${DEV_DIR}/proprietary-files.txt"
