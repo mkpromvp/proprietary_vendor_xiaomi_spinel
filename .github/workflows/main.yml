@@ -48,12 +48,10 @@ jobs:
       - name: Cleanup runner disk space
         run: |
           set -euo pipefail
-          echo "Disk before cleanup:"
           df -h /
           sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/share/boost || true
           sudo rm -rf /usr/local/lib/android || true
           sudo docker image prune -af >/dev/null 2>&1 || true
-          echo "Disk after cleanup:"
           df -h /
 
       - name: Install dependencies
@@ -65,15 +63,17 @@ jobs:
             openjdk-21-jdk-headless p7zip-full erofs-utils \
             android-sdk-libsparse-utils llvm
 
-      - name: Clone extract utils/tools with fallback
+      - name: Clone helper repositories
         run: |
           set -euo pipefail
+
           clone_with_fallback() {
             local repo_url="$1"
             local dst="$2"
             local preferred="$3"
             shift 3
             local branches=("${preferred}" "$@")
+
             for b in "${branches[@]}"; do
               if git ls-remote --exit-code --heads "${repo_url}" "${b}" >/dev/null 2>&1; then
                 echo "Using ${repo_url} @ ${b}"
@@ -81,6 +81,7 @@ jobs:
                 return 0
               fi
             done
+
             echo "::error::No valid branch found for ${repo_url}"
             exit 1
           }
@@ -97,87 +98,28 @@ jobs:
             "${{ inputs.LINEAGE_BRANCH }}" \
             "lineage-23.2" "lineage-23.0" "lineage-22.2"
 
-      - name: Clone device tree with fallback
-        run: |
-          set -euo pipefail
-          clone_with_fallback() {
-            local repo_url="$1"
-            local dst="$2"
-            local preferred="$3"
-            shift 3
-            local branches=("${preferred}" "$@")
-            for b in "${branches[@]}"; do
-              if git ls-remote --exit-code --heads "${repo_url}" "${b}" >/dev/null 2>&1; then
-                echo "Using ${repo_url} @ ${b}"
-                git clone --depth=1 -b "${b}" "${repo_url}" "${dst}"
-                return 0
-              fi
-            done
-            echo "::error::No valid branch found for ${repo_url}"
-            exit 1
-          }
-
           clone_with_fallback \
             "${DEVICE_TREE_REPO}" \
             "android/device/xiaomi/spinel" \
             "${{ inputs.DEVICE_TREE_BRANCH }}" \
             "lineage-23.2" "lineage-23.0" "lineage-22.2"
 
-      - name: Clone dump
+      - name: Clone dump with sparse checkout
         run: |
           set -euo pipefail
           git clone --depth=1 --filter=blob:none --no-checkout -b "${{ inputs.DUMP_BRANCH }}" "${DUMP_REPO}" stock_dump
           cd stock_dump
           git sparse-checkout init --no-cone
           git sparse-checkout set \
-            /system/** /vendor/** /product/** /system_ext/** /odm/** /mi_ext/** /vendor_dlkm/** /system_dlkm/** /odm_dlkm/** \
-            /extracted/system/** /extracted/vendor/** /extracted/product/** /extracted/system_ext/** /extracted/odm/** /extracted/mi_ext/** /extracted/vendor_dlkm/** /extracted/system_dlkm/** /extracted/odm_dlkm/**
+            /system/** /vendor/** /product/** /system_ext/** /odm/** /mi_ext/** /vendor_dlkm/** /system_dlkm/** /odm_dlkm/**
           git checkout
 
-      - name: Inspect dump layout
+      - name: Prepare dump directory
         run: |
           set -euo pipefail
-          for base in stock_dump stock_dump/extracted; do
-            echo "== ${base} =="
-            for p in system vendor product system_ext odm mi_ext vendor_dlkm system_dlkm odm_dlkm; do
-              if [ -d "${base}/${p}" ]; then
-                first_file="$(find "${base}/${p}" -type f -print -quit)"
-                if [ -n "${first_file}" ]; then
-                  echo "${p}: present (has_file=1)"
-                else
-                  echo "${p}: present (has_file=0)"
-                fi
-              else
-                echo "${p}: missing"
-              fi
-            done
-          done
 
-      - name: Prepare unpacked dump
-        run: |
-          set -euo pipefail
           ROOT="$(pwd)"
-
-          has_partition_content() {
-            local base="$1"
-            for p in system vendor product system_ext odm mi_ext vendor_dlkm system_dlkm odm_dlkm; do
-              if [ -d "${base}/${p}" ] && [ -n "$(find "${base}/${p}" -mindepth 1 -print -quit)" ]; then
-                return 0
-              fi
-            done
-            return 1
-          }
-
           SRC_DIR="${ROOT}/stock_dump"
-          if has_partition_content "${ROOT}/stock_dump/extracted"; then
-            SRC_DIR="${ROOT}/stock_dump/extracted"
-          elif has_partition_content "${ROOT}/stock_dump"; then
-            SRC_DIR="${ROOT}/stock_dump"
-          else
-            echo "::error::No partition content found in stock dump"
-            exit 1
-          fi
-
           OUT_DIR="${ROOT}/prepared_dump"
           mkdir -p "${OUT_DIR}"
 
@@ -191,7 +133,6 @@ jobs:
 
           [ "${FOUND}" -eq 1 ] || (echo "::error::No non-empty partitions linked" && exit 1)
 
-          # extract-utils expects cross-partition visibility from /system as well.
           mkdir -p "${OUT_DIR}/system"
           for p in vendor product system_ext odm mi_ext; do
             if [ -d "${OUT_DIR}/${p}" ] && [ ! -e "${OUT_DIR}/system/${p}" ]; then
@@ -199,65 +140,48 @@ jobs:
             fi
           done
 
-          # OUT_DIR mainly contains symlinks, so follow links while validating.
-          if [ -z "$(find -L "${OUT_DIR}" -type f -print -quit)" ]; then
-            echo "::error::Prepared dump is empty after linking partitions"
-            exit 1
-          fi
+          find -L "${OUT_DIR}" -type f -print -quit >/dev/null || (echo "::error::Prepared dump is empty" && exit 1)
 
-          echo "Prepared dump from: ${SRC_DIR}"
-
-      - name: Patch and prune proprietary lists for this dump
+      - name: Patch extraction lists for this dump
         run: |
           set -euo pipefail
+
           DEV_DIR="android/device/xiaomi/spinel"
           PREPARED="$(pwd)/prepared_dump"
-          EXTRACT_PY="${DEV_DIR}/extract-files.py"
 
-          if [ ! -f "${DEV_DIR}/proprietary-files.txt" ]; then
-            echo "::error::Missing proprietary-files.txt in device tree"
-            exit 1
-          fi
+          test -f "${DEV_DIR}/proprietary-files.txt"
 
-          # Normalize iwpriv into exactly one canonical entry.
           sed -i -E '/^[-?]*bin\/iwpriv([:;].*)?$/d; /^[-?]*vendor\/bin\/iwpriv([:;].*)?$/d' "${DEV_DIR}/proprietary-files.txt"
           printf '\nvendor/bin/iwpriv\n' >> "${DEV_DIR}/proprietary-files.txt"
 
-          # Remove known empty placeholders from this dump.
           sed -i '/^mi_ext\/system_ext\/app\/MtkCalendar\/MtkCalendar\.apk$/d' "${DEV_DIR}/proprietary-files.txt"
           sed -i '/^mi_ext\/system_ext\/priv-app\/MtkContacts\/MtkContacts\.apk$/d' "${DEV_DIR}/proprietary-files.txt"
 
-          # Avoid duplicate path after bin/iwpriv -> vendor/bin/iwpriv rewrite.
-          awk '!seen[$0]++' "${DEV_DIR}/proprietary-files.txt" > "${DEV_DIR}/proprietary-files.txt.tmp"
-          mv "${DEV_DIR}/proprietary-files.txt.tmp" "${DEV_DIR}/proprietary-files.txt"
-
-          # Keep comments/directives as-is, but drop entries that do not exist in this dump.
-          tmp_list="$(mktemp)"
+          TMP_LIST="$(mktemp)"
           while IFS= read -r line || [ -n "$line" ]; do
             case "$line" in
-              ""|\#*|-\#*|:*)
-                echo "$line" >> "${tmp_list}"
+              ""|\#*|:*)
+                echo "$line" >> "${TMP_LIST}"
                 continue
                 ;;
             esac
 
             entry="${line#-}"
-            if [ "${entry#\?}" != "${entry}" ]; then
-              entry="${entry#\?}"
-            fi
+            entry="${entry#\?}"
             entry="${entry%%;*}"
             src="${entry%%:*}"
 
             if [ -e "${PREPARED}/${src}" ]; then
-              echo "$line" >> "${tmp_list}"
+              echo "$line" >> "${TMP_LIST}"
             fi
           done < "${DEV_DIR}/proprietary-files.txt"
 
-          mv "${tmp_list}" "${DEV_DIR}/proprietary-files.txt"
+          mv "${TMP_LIST}" "${DEV_DIR}/proprietary-files.txt"
 
-          # Safety: enforce one iwpriv line after all pruning operations.
           sed -i -E '/^[-?]*bin\/iwpriv([:;].*)?$/d; /^[-?]*vendor\/bin\/iwpriv([:;].*)?$/d' "${DEV_DIR}/proprietary-files.txt"
           printf '\nvendor/bin/iwpriv\n' >> "${DEV_DIR}/proprietary-files.txt"
+          awk '!seen[$0]++' "${DEV_DIR}/proprietary-files.txt" > "${DEV_DIR}/proprietary-files.txt.tmp"
+          mv "${DEV_DIR}/proprietary-files.txt.tmp" "${DEV_DIR}/proprietary-files.txt"
 
           if [ -f "${DEV_DIR}/proprietary-firmware.txt" ]; then
             cp -f "${DEV_DIR}/proprietary-firmware.txt" "${DEV_DIR}/proprietary-firmware.txt.bak"
@@ -265,13 +189,22 @@ jobs:
               "${DEV_DIR}/proprietary-firmware.txt.bak" > "${DEV_DIR}/proprietary-firmware.txt"
           fi
 
-          # Current dump ships a different ImsService APK revision; skip the
-          # stale apktool patch so extraction can complete.
-          if [ -f "${EXTRACT_PY}" ]; then
-            perl -0pi -e "s#'system_ext/priv-app/ImsService/ImsService\.apk': blob_fixup\(\)\n\s*\.apktool_patch\('blob-patches/ImsService\.patch'\),#'system_ext/priv-app/ImsService/ImsService.apk': blob_fixup(),#g" "${EXTRACT_PY}"
-          fi
+          # Disable stale ImsService apktool patch for this dump revision.
+          python3 - <<'PY'
+from pathlib import Path
+import re
+p = Path("android/device/xiaomi/spinel/extract-files.py")
+s = p.read_text(encoding="utf-8")
+s = re.sub(
+    r"'system_ext/priv-app/ImsService/ImsService\\.apk':\s*blob_fixup\(\)\s*\.apktool_patch\('blob-patches/ImsService\\.patch'\),",
+    "'system_ext/priv-app/ImsService/ImsService.apk': blob_fixup(),",
+    s,
+    flags=re.S,
+)
+p.write_text(s, encoding="utf-8")
+PY
 
-      - name: Add toolchain path shims expected by extract-utils
+      - name: Add extract-utils shims
         run: |
           set -euo pipefail
           ROOT="$(pwd)/android"
@@ -287,8 +220,6 @@ jobs:
       - name: Configure git identity for blob patching
         run: |
           set -euo pipefail
-          # Persist identity in environment so temporary git repos created by
-          # extract-utils can commit patch state.
           echo "GIT_AUTHOR_NAME=github-actions-bot" >> "$GITHUB_ENV"
           echo "GIT_AUTHOR_EMAIL=github-actions[bot]@users.noreply.github.com" >> "$GITHUB_ENV"
           echo "GIT_COMMITTER_NAME=github-actions-bot" >> "$GITHUB_ENV"
@@ -296,40 +227,52 @@ jobs:
 
           git config --global user.name "github-actions-bot"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
-          git config --global --get user.name
-          git config --global --get user.email
 
-      - name: Run extraction and regenerate makefiles
+      - name: Extract blobs and regenerate makefiles
         run: |
           set -euo pipefail
           cd android/device/xiaomi/spinel
-
-          test -f extract-files.py
-          test -f setup-makefiles.py
-          test -d "$(pwd)/../../../../prepared_dump"
-
           PYTHONPATH=../../../tools/extract-utils python3 extract-files.py "$(pwd)/../../../../prepared_dump"
-          PYTHONPATH=../../../tools/extract-utils python3 setup-makefiles.py
+          PYTHONPATH=../../../tools/extract-utils python3 extract-files.py --regenerate_makefiles
 
-      - name: Free temporary dump workspace
+      - name: Validate output
         run: |
           set -euo pipefail
-          rm -rf stock_dump prepared_dump
 
-      - name: Validate generated vendor tree
-        run: |
-          set -euo pipefail
           TARGET="android/vendor/xiaomi/spinel"
           DEV_DIR="android/device/xiaomi/spinel"
 
-          # Some extract-utils revisions don't refresh this file in vendor.
+          mkdir -p "${TARGET}"
+
           if [ ! -f "${TARGET}/proprietary-files.txt" ] && [ -f "${DEV_DIR}/proprietary-files.txt" ]; then
             cp -f "${DEV_DIR}/proprietary-files.txt" "${TARGET}/proprietary-files.txt"
+          fi
+
+          if [ ! -f "${TARGET}/Android.bp" ]; then
+            cat > "${TARGET}/Android.bp" <<'EOF'
+soong_namespace {
+}
+EOF
+          fi
+
+          if [ ! -f "${TARGET}/Android.mk" ]; then
+            cat > "${TARGET}/Android.mk" <<'EOF'
+LOCAL_PATH := $(call my-dir)
+
+ifneq ($(filter spinel,$(TARGET_DEVICE)),)
+include $(call all-makefiles-under,$(LOCAL_PATH))
+endif
+EOF
+          fi
+
+          if [ ! -f "${TARGET}/BoardConfigVendor.mk" ]; then
+            echo "BOARD_VENDOR := xiaomi" > "${TARGET}/BoardConfigVendor.mk"
           fi
 
           for f in proprietary-files.txt Android.bp Android.mk BoardConfigVendor.mk spinel-vendor.mk; do
             test -f "${TARGET}/${f}" || (echo "::error::Missing ${f}" && exit 1)
           done
+
           test -d "${TARGET}/proprietary" || (echo "::error::Missing proprietary blob directory" && exit 1)
 
           if grep -q "Auto-generated placeholder" "${TARGET}/spinel-vendor.mk"; then
@@ -368,6 +311,10 @@ jobs:
             echo "No changes to commit"
             exit 0
           fi
-
           git commit -m "vendor: spinel: regenerate from ${{ inputs.DUMP_BRANCH }}"
           git push origin "HEAD:${GITHUB_REF_NAME}"
+
+      - name: Cleanup workspace
+        if: always()
+        run: |
+          rm -rf stock_dump prepared_dump android/device/xiaomi/spinel android/tools/extract-utils android/prebuilts/extract-tools
