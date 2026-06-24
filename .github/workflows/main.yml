@@ -10,12 +10,12 @@ on:
       DEVICE_TREE_BRANCH:
         description: "Device tree branch"
         required: false
-        default: "lineage-22.2"
+        default: "lineage-23.2"
         type: string
       LINEAGE_BRANCH:
         description: "Branch for extract-utils and extract-tools"
         required: false
-        default: "lineage-22.2"
+        default: "lineage-23.2"
         type: string
       PUSH_TO_REPO:
         description: "Push generated tree to this repository"
@@ -174,5 +174,5 @@ jobs:
             echo "No changes to commit"
           else
             git commit -m "vendor: spinel: update blobs from Stock_room_dumb"
-            git push origin HEAD:main
+            git push origin "HEAD:${GITHUB_REF_NAME}"
           fi
