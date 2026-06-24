@@ -381,14 +381,20 @@ jobs:
         run: |
           set -e
           TARGET_DIR="android/vendor/xiaomi/spinel"
+          BLOBS_DIR="${TARGET_DIR}/proprietary"
           if [ ! -d "${TARGET_DIR}" ]; then
             echo "::error::Vendor output directory missing: ${TARGET_DIR}"
             exit 1
           fi
 
-          FILE_COUNT=$(find "${TARGET_DIR}" -type f | wc -l)
+          if [ ! -d "${BLOBS_DIR}" ]; then
+            echo "::error::Blobs directory missing: ${BLOBS_DIR}"
+            exit 1
+          fi
+
+          FILE_COUNT=$(find "${BLOBS_DIR}" -type f | wc -l)
           echo "Generated files: ${FILE_COUNT}"
-          find "${TARGET_DIR}" -type f | head -120 || true
+          find "${BLOBS_DIR}" -type f | head -120 || true
 
           if [ "${FILE_COUNT}" -lt 20 ]; then
             echo "::error::Vendor tree looks incomplete"
